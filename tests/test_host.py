@@ -170,6 +170,11 @@ class HostFiles(unittest.TestCase):
             with self.subTest(name):
                 self.assertFails(self.infra({'inventory/hosts/web-01.yml': content}), message)
 
+    def test_keyword_group(self):
+        # a Python keyword is a valid group name for Ansible
+        inv = self.infra({'inventory/hosts/web-01.yml': 'plugin: ofzhur.ansible.host\ngroups: [common, global]\n'}).inventory()
+        self.assertEqual(inv['global']['hosts'], ['web-01'])
+
     def test_second_file_for_a_host_fails(self):
         # also when the static groups list the host first
         groups = 'monitoring:\n  hosts:\n    web-01:\n'

@@ -1,0 +1,145 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# meta/argument_specs.yml has been checked before the first task.
+
+# An entry applies when it has no hosts or its pattern matches this host.
+# The pattern is matched against the whole inventory (the magic variable
+# groups), not the hosts of --limit: one inventory_hostnames lookup per
+# targeted entry and host, on the control machine.
+- name: Select the entries of this host
+  no_log: true  # the entries may hold password hashes
+  ansible.builtin.set_fact:
+    __users_selected_groups: >-
+      {%- set ns = namespace(selected=[]) -%}
+      {%- for g in users_groups
+            if g.hosts | default(none) is none
+            or inventory_hostname in query('ansible.builtin.inventory_hostnames', *([g.hosts] if g.hosts is string else g.hosts)) -%}
+      {%-   set ns.selected = ns.selected + [g] -%}
+      {%- endfor -%}
+      {{ ns.selected }}
+    __users_selected: >-
+      {%- set ns = namespace(selected=[]) -%}
+      {%- for u in users
+            if u.hosts | default(none) is none
+            or inventory_hostname in query('ansible.builtin.inventory_hostnames', *([u.hosts] if u.hosts is string else u.hosts)) -%}
+      {%-   set ns.selected = ns.selected + [u] -%}
+      {%- endfor -%}
+      {{ ns.selected }}
+
+# Two entries for one name would undo each other on every run.
+- name: Refuse a group or user selected twice
+  ansible.builtin.assert:
+    that: __users_twice == []
+    fail_msg: "users: selected twice for {{ inventory_hostname }}: {{ __users_twice | join(', ') }}"
+    quiet: true
+  vars:
+    __users_twice: >-
+      {{ (__users_selected_groups | groupby('name') + __users_selected | groupby('name'))
+         | selectattr('list.1', 'defined') | map(attribute='grouper') | list }}
+
+# Any change to them (keys, home, shell, sudo) can lock Ansible out.
+- name: Refuse to manage a protected user
+  ansible.builtin.assert:
+    that: __users_refused == []
+    fail_msg: "users: {{ __users_refused | join(', ') }} in users_protected; no entry may manage them"
+    quiet: true
+  vars:
+    __users_refused: "{{ __users_selected | map(attribute='name') | select('in', users_protected) | list }}"
+
+- name: Groups
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    gid: "{{ item.gid | default(omit) }}"
+    system: "{{ item.system | default(false) }}"
+  loop: "{{ __users_selected_groups }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.state | default('present') == 'present'
+
+- name: Users
+  ansible.builtin.user:
+    name: "{{ item.name }}"
+    state: "{{ item.state | default('present') }}"
+    comment: "{{ item.comment | default(omit) }}"
+    uid: "{{ item.uid | default(omit) }}"
+    group: "{{ item.group | default(omit) }}"
+    groups: "{{ item.groups | default(omit) }}"
+    append: "{{ item.append | default(true) if item.groups | default(none) is not none else omit }}"
+    shell: "{{ item.shell | default(users_shell) }}"
+    home: "{{ item.home | default(omit) }}"
+    create_home: "{{ item.create_home | default(true) }}"
+    system: "{{ item.system | default(false) }}"
+    password: "{{ item.password | default(omit) }}"
+    remove: "{{ item.remove | default(false) }}"
+  loop: "{{ __users_selected }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ item.password is defined }}"
+  register: __users_result
+
+# item is the result of the task Users: item.item the entry, item.home and
+# item.group (a GID) the user's. A user to be created in check mode has
+# no home yet and is skipped.
+- name: Directories ~/.ssh
+  ansible.builtin.file:
+    path: "{{ item.home }}/.ssh"
+    state: directory
+    follow: false  # a ~/.ssh the user made a link fails here: root would chown its target
+    owner: "{{ item.item.name }}"
+    group: "{{ item.group }}"
+    mode: "0700"
+  loop: "{{ __users_result.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  no_log: "{{ item.item.password is defined }}"
+  when: item.item.get('keys') is not none and item.home is defined
+
+- name: SSH keys
+  ansible.builtin.copy:
+    # one key per line, each ending with a newline; a string is one key; no keys, an empty file
+    content: "{{ ((([item.item['keys']] if item.item['keys'] is string else item.item['keys']) | map('trim') | list) + ['']) | join('\n') }}"
+    dest: "{{ item.home }}/.ssh/authorized_keys"
+    owner: "{{ item.item.name }}"
+    group: "{{ item.group }}"
+    mode: "0600"
+  loop: "{{ __users_result.results }}"
+  loop_control:
+    label: "{{ item.item.name }}"
+  no_log: "{{ item.item.password is defined }}"
+  when: item.item.get('keys') is not none and item.home is defined
+
+# sudo skips files in /etc/sudoers.d whose name has a dot.
+- name: Sudo
+  ansible.builtin.copy:
+    content: "{{ item.name }} ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    dest: /etc/sudoers.d/{{ item.name | replace('.', '_') }}
+    owner: root
+    group: root
+    mode: "0440"
+    validate: visudo -cf %s
+  loop: "{{ __users_selected }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ item.password is defined }}"
+  when: item.state | default('present') == 'present' and item.sudo | default(false) | bool
+
+- name: No sudo
+  ansible.builtin.file:
+    path: /etc/sudoers.d/{{ item.name | replace('.', '_') }}
+    state: absent
+  loop: "{{ __users_selected }}"
+  loop_control:
+    label: "{{ item.name }}"
+  no_log: "{{ item.password is defined }}"
+  when: item.state | default('present') == 'absent' or not item.sudo | default(false) | bool
+
+# After the users: a group may be the primary group of a user removed above.
+- name: Groups to remove
+  ansible.builtin.group:
+    name: "{{ item.name }}"
+    state: absent
+  loop: "{{ __users_selected_groups }}"
+  loop_control:
+    label: "{{ item.name }}"
+  when: item.state | default('present') == 'absent'

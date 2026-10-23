@@ -40,7 +40,7 @@ options:
 EXAMPLES = r"""
 # inventory/hosts/web-01.yml: the host web-01
 plugin: ofzhur.ansible.host
-groups: [role_web, account_main, os_ubuntu_26_04]
+groups: [common, web]
 vars:
   ansible_host: 203.0.113.10
   ansible_user: ump
@@ -66,6 +66,7 @@ else:
 
 KEYS = ('plugin', 'groups', 'vars')
 HOST_NAME = re.compile(r'^[A-Za-z0-9_][A-Za-z0-9_.-]*$')
+GROUP_NAME = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
 
 
 class InventoryModule(BaseInventoryPlugin):
@@ -97,7 +98,7 @@ class InventoryModule(BaseInventoryPlugin):
         groups = data.get('groups') or []
         if not isinstance(groups, list):
             raise AnsibleParserError(f'{path}: groups must be a list of group names')
-        bad = [str(g) for g in groups if not isinstance(g, str) or not isidentifier(g)]
+        bad = [str(g) for g in groups if not isinstance(g, str) or not GROUP_NAME.match(g)]
         if bad:
             raise AnsibleParserError(f'{path}: invalid group name(s) {", ".join(bad)} (letters, digits and "_", not starting with a digit)')
         hostvars = data.get('vars') or {}

@@ -1,0 +1,12 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+#
+# The base of every server; more roles join later.
+#
+#   ansible-playbook ofzhur.ansible.base
+
+- name: Base
+  hosts: all
+  become: true
+  roles:
+    - ofzhur.ansible.users

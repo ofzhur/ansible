@@ -1,0 +1,122 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+argument_specs:
+  main:
+    short_description: OS users and groups, their SSH keys and sudo
+    description:
+      - Creates, changes and removes OS groups and users from variables, usually group vars.
+      - Each entry applies to every host of the play, or to the hosts its O(users[].hosts) selects.
+      - An unknown key or a wrong type fails the run before any change.
+    author: Oleg Zhurko (@ofzhur)
+    options:
+      users:
+        description: OS users, in order.
+        type: list
+        elements: dict
+        default: []
+        options:
+          name:
+            description: User name.
+            type: str
+            required: true
+          state:
+            description: C(absent) removes the user and its sudoers file.
+            type: str
+            choices: [present, absent]
+            default: present
+          comment:
+            description: The GECOS field.
+            type: str
+          uid:
+            description: User ID.
+            type: int
+          group:
+            description:
+              - Primary group. It must exist; O(users_groups) creates it.
+              - Not set, a new user gets a new group of its name. Set it when a group of that name exists already.
+            type: str
+          groups:
+            description: Supplementary groups. They must exist.
+            type: list
+            elements: str
+          append:
+            description: C(true) adds O(users[].groups) to the user's groups, C(false) makes them its only ones. Only with O(users[].groups).
+            type: bool
+            default: true
+          shell:
+            description: Login shell. Default O(users_shell).
+            type: str
+          home:
+            description: Home directory. Default the system's, C(/home/NAME).
+            type: str
+          create_home:
+            description: Create the home directory.
+            type: bool
+            default: true
+          system:
+            description: A system account (on creation).
+            type: bool
+            default: false
+          password:
+            description:
+              - Password hash, as in C(/etc/shadow).
+              - Not set by default; a new user then has no usable password and logs in with keys only.
+            type: str
+          keys:
+            description:
+              - SSH public key lines (a string is one key). C(~/.ssh/authorized_keys) holds exactly these keys.
+              - Not set, the file is not touched.
+            type: list
+            elements: str
+          sudo:
+            description: 'C(true) writes C(/etc/sudoers.d/NAME): "NAME ALL=(ALL:ALL) NOPASSWD: ALL". C(false) removes it.'
+            type: bool
+            default: false
+          remove:
+            description: With C(state=absent), also remove the home directory.
+            type: bool
+            default: false
+          hosts:
+            description:
+              - Host pattern, as for the C(hosts) of a play, matched against the whole inventory (not only C(--limit)).
+              - A list joins its patterns like C(a:b).
+              - Not set, the entry applies to every host.
+            type: list
+            elements: str
+      users_groups:
+        description: OS groups, in order. Present groups are created before the users, absent ones removed after them.
+        type: list
+        elements: dict
+        default: []
+        options:
+          name:
+            description: Group name.
+            type: str
+            required: true
+          state:
+            description: Present or absent.
+            type: str
+            choices: [present, absent]
+            default: present
+          gid:
+            description: Group ID.
+            type: int
+          system:
+            description: A system group (on creation).
+            type: bool
+            default: false
+          hosts:
+            description: Host pattern, as O(users[].hosts).
+            type: list
+            elements: str
+      users_shell:
+        description: Shell of a user without O(users[].shell).
+        type: str
+        default: /bin/bash
+      users_protected:
+        description:
+          - Users that no entry may manage.
+          - Default C(root) and C(ansible_user), when set.
+        type: list
+        elements: str

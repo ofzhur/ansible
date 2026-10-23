@@ -3,11 +3,11 @@
 
 namespace: ofzhur
 name: ansible
-version: 0.1.0
+version: 0.2.0
 readme: README.md
 authors:
   - Oleg Zhurko <oleg@zhurko.de>
-description: Plugins, roles and configuration shared by infrastructure repositories provisioned with ump.
+description: Plugins, roles, playbooks and configuration shared by infrastructure repositories provisioned with ump.
 license:
   - MIT
 tags:

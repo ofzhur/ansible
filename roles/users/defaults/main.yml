@@ -1,0 +1,13 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# OS users and groups; see README.md and meta/argument_specs.yml.
+users: []
+users_groups: []
+
+# Shell of a user without one.
+users_shell: /bin/bash
+
+# Users that no entry may remove, give keys or take sudo from: root and
+# the user Ansible connects as.
+users_protected: "{{ ['root'] + ([ansible_user] if ansible_user is defined else []) }}"

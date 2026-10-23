@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+galaxy_info:
+  author: Oleg Zhurko
+  description: OS users and groups, their SSH keys and sudo, each optionally targeted at hosts.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: [all]
+    - name: Debian
+      versions: [all]
+    - name: ArchLinux
+      versions: [all]
+
+dependencies: []
