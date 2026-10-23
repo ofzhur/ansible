@@ -1,0 +1,20 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+namespace: ofzhur
+name: ansible
+version: 0.1.0
+readme: README.md
+authors:
+  - Oleg Zhurko <oleg@zhurko.de>
+description: Plugins, roles and configuration shared by infrastructure repositories provisioned with ump.
+license:
+  - MIT
+tags:
+  - infrastructure
+  - inventory
+  - ump
+repository: https://github.com/ofzhur/ansible
+issues: https://github.com/ofzhur/ansible/issues
+build_ignore:
+  - tests
