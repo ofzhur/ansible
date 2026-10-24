@@ -1,11 +1,16 @@
 {# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
 {# MIT License (see LICENSE) #}
 # Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
-# The firewall's iptables rules, loaded before the network comes up. No
-# ExecStop: stopping the unit leaves them in place.
+# The firewall's iptables chain OFZHUR-INPUT, loaded before the network
+# comes up: refilled alone (--noflush), other chains and the policies
+# untouched, and jumped to first from INPUT, once. IPv6 where the kernel
+# has it: none booted with ipv6.disable=1. After the units that restore a
+# whole table (iptables-persistent's, Arch's), which would drop the chain.
+# No ExecStop: stopping the unit leaves the rules in place.
 [Unit]
 Description=Firewall (iptables, ofzhur.ansible.firewall)
 Wants=network-pre.target
+After=netfilter-persistent.service iptables.service ip6tables.service
 Before=network-pre.target shutdown.target
 Conflicts=shutdown.target
 DefaultDependencies=no
@@ -13,10 +18,12 @@ DefaultDependencies=no
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4
-ExecStart=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
-ExecReload=/usr/sbin/iptables-restore /etc/iptables/rules.v4
-ExecReload=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
+{% for exec in ['ExecStart', 'ExecReload'] %}
+{{ exec }}=/usr/sbin/iptables-restore -w --noflush /etc/iptables/ofzhur-firewall.v4
+{{ exec }}=/bin/sh -c 'iptables -w -C INPUT -j OFZHUR-INPUT >/dev/null 2>&1 || iptables -w -I INPUT 1 -j OFZHUR-INPUT'
+{{ exec }}=/bin/sh -c 'test ! -d /proc/sys/net/ipv6 || ip6tables-restore -w --noflush /etc/iptables/ofzhur-firewall.v6'
+{{ exec }}=/bin/sh -c 'test ! -d /proc/sys/net/ipv6 || ip6tables -w -C INPUT -j OFZHUR-INPUT >/dev/null 2>&1 || ip6tables -w -I INPUT 1 -j OFZHUR-INPUT'
+{% endfor %}
 
 [Install]
 WantedBy=sysinit.target

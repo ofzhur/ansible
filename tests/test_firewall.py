@@ -6,9 +6,11 @@
 The checks run the ansible CLI found on PATH only. The scenarios also run
 Docker: two containers per image (web-01, db-01) with systemd, reached over
 SSH as the user ump the way ump leaves a server; db-01 has the firewall ump
-installs, web-01 none. A network of their own (eth1, IPv4 and IPv6) joins
-them and a third container, the client. They are privileged (systemd,
-netfilter in their own network namespace). Without Docker they are skipped.
+installs, web-01 none and the nftables.service of Arch Linux. A network of
+their own (eth1, IPv4 and IPv6) joins them and a third container, the
+client. They are privileged (systemd, netfilter in their own network
+namespace). db-01 also forwards, the way Docker does: rules of other
+software the firewall leaves alone. Without Docker they are skipped.
 
     python3 tests/test_firewall.py
 """
@@ -391,6 +393,24 @@ table inet filter {
 }
 """
 
+# nftables.service as Arch Linux and CachyOS ship it (nftables 1:1.1.7), for
+# web-01: a oneshot without RemainAfterExit, ExecReload or ExecStop. nft in
+# /usr/sbin, as on Debian; on Arch /usr/sbin is /usr/bin.
+ARCH_UNIT = """\
+[Unit]
+Description=Netfilter Tables
+Documentation=man:nft(8)
+Wants=network-pre.target
+Before=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/nft -f /etc/nftables.conf
+
+[Install]
+WantedBy=multi-user.target
+"""
+
 HOST = """\
 plugin: ofzhur.ansible.host
 groups: [common]
@@ -410,6 +430,81 @@ firewall_rules:
     hosts: web-01
     comment: http
 """
+
+# Docker's way through db-01, in short: a network namespace behind a veth
+# pair, forwarding on, masquerade and a forward chain, policy drop, in a
+# table of its own.
+FOREIGN = """\
+table ip foreign {
+  chain forward {
+    type filter hook forward priority 0; policy drop;
+    iifname "veth-foreign" accept
+    oifname "veth-foreign" ct state established,related accept
+  }
+  chain postrouting {
+    type nat hook postrouting priority 100;
+    ip saddr 10.231.0.0/24 oifname != "veth-foreign" masquerade
+  }
+}
+"""
+
+NAMESPACE = ('ip netns add foreign'
+             ' && ip link add veth-foreign type veth peer name eth0 netns foreign'
+             ' && ip address add 10.231.0.1/24 dev veth-foreign && ip link set veth-foreign up'
+             ' && ip -n foreign address add 10.231.0.2/24 dev eth0 && ip -n foreign link set eth0 up'
+             ' && ip -n foreign route add default via 10.231.0.1'
+             ' && sysctl -qw net.ipv4.ip_forward=1')
+
+# Docker's chain in the table filter, in short: jumped to from FORWARD,
+# whose policy Docker sets to drop.
+DOCKER_CHAIN = ('iptables -w -N DOCKER-TEST'
+                ' && iptables -w -A DOCKER-TEST -i veth-foreign -j ACCEPT'
+                ' && iptables -w -A DOCKER-TEST -o veth-foreign -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT'
+                ' && iptables -w -A FORWARD -j DOCKER-TEST && iptables -w -P FORWARD DROP')
+
+
+# The unit 0.4.0 wrote: the whole table filter, restored from rules.v4 and
+# rules.v6.
+OLD_UNIT = """\
+# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
+# The firewall's iptables rules, loaded before the network comes up. No
+# ExecStop: stopping the unit leaves them in place.
+[Unit]
+Description=Firewall (iptables, ofzhur.ansible.firewall)
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+ExecStart=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
+ExecReload=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+ExecReload=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
+
+[Install]
+WantedBy=sysinit.target
+"""
+
+
+def old_rules(family):
+    """The rules 0.4.0 wrote for db-01: the whole table filter, the role's rules right in INPUT."""
+    command = 'iptables' if family == 4 else 'ip6tables'
+    icmp6 = ''.join(f'-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type {t} -j ACCEPT\n' for t in (1, 2, 3, 4, 130, 134, 135, 136))
+    echo = '-p icmp -m icmp --icmp-type 8' if family == 4 else '-p ipv6-icmp -m icmp6 --icmpv6-type 128'
+    return ('# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.\n'
+            f'# {command}-restore /etc/iptables/rules.v{family} applies it; ofzhur-iptables.service loads it at boot.\n'
+            '*filter\n:INPUT DROP [0:0]\n:FORWARD DROP [0:0]\n:OUTPUT ACCEPT [0:0]\n'
+            '-A INPUT -i lo -j ACCEPT\n'
+            '-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT\n'
+            '-A INPUT -m conntrack --ctstate INVALID -j DROP\n'
+            + (icmp6 if family == 6 else '')
+            + f'-A INPUT {echo} -j ACCEPT\n'
+            '-A INPUT -p tcp -m tcp --dport 22 -m comment --comment "ssh" -j ACCEPT\n'
+            'COMMIT\n')
+
 
 HOSTS = ('web-01', 'db-01')
 PORTS = ('22', '8080', '8081')
@@ -466,6 +561,8 @@ class Scenario:
         docker('exec', '-i', cls.names['db-01'], 'sh', '-c',
                'cat > /etc/nftables.conf && chmod 755 /etc/nftables.conf && systemctl enable --now nftables',
                input=UMP_RULESET)
+        docker('exec', '-i', cls.names['web-01'], 'sh', '-c',
+               'cat > /etc/systemd/system/nftables.service && systemctl daemon-reload', input=ARCH_UNIT)
         cls.ready()
 
     @classmethod
@@ -561,29 +658,89 @@ class Scenario:
         for host in HOSTS:
             self.assertEqual(counts[host]['changed'], 0, host)
 
+    def forwarding(self):
+        """Docker's way through db-01, built where missing (a restart drops it)."""
+        self.link()
+        if self.sh('db-01', 'ip netns list | grep -qw foreign').returncode:
+            self.out('db-01', NAMESPACE)
+        docker('exec', '-i', self.names['db-01'], 'sh', '-c', 'nft list table ip foreign >/dev/null 2>&1 || nft -f -',
+               input=FOREIGN)
+
+    def forwards(self):
+        """Whether a new connection from the namespace behind db-01 gets to HTTP on web-01, forwarded."""
+        return self.sh('db-01', 'ip netns exec foreign python3 -c \'import socket; socket.create_connection('
+                                f'("{self.address["web-01"][4]}", 8080), timeout=2)\'').returncode == 0
+
+    def assertDocker(self):
+        """Docker's chain on db-01, FORWARD dropping but for it, and its way through."""
+        self.assertEqual(self.out('db-01', 'iptables -S FORWARD'), '-P FORWARD DROP\n-A FORWARD -j DOCKER-TEST\n')
+        self.assertEqual(len(self.out('db-01', 'iptables -S DOCKER-TEST').splitlines()), 3)
+        self.assertTrue(self.forwards())
+
+    def old_layout(self, host):
+        """The host as 0.4.0 left it with iptables: its rules loaded, its files and its unit, none of this layout's."""
+        for family, command in ((4, 'iptables'), (6, 'ip6tables')):
+            docker('exec', '-i', self.names[host], 'sh', '-c', f'tee /etc/iptables/rules.v{family} | {command}-restore',
+                   input=old_rules(family))
+        docker('exec', '-i', self.names[host], 'sh', '-c',
+               'cat > /etc/systemd/system/ofzhur-iptables.service && systemctl daemon-reload'
+               ' && rm -f /etc/iptables/ofzhur-firewall.v4 /etc/iptables/ofzhur-firewall.v6', input=OLD_UNIT)
+        self.assertTrue(self.out(host, 'iptables -S INPUT').startswith('-P INPUT DROP\n-A INPUT -i lo -j ACCEPT\n'))
+
     def assertNftables(self):
         for host in HOSTS:
-            self.assertEqual(self.tables(host), ['table inet ofzhur'], host)
+            # the role's table, ump's gone; the tables of other software are theirs
+            self.assertEqual([t for t in self.tables(host) if t.startswith('table inet ')], ['table inet ofzhur'], host)
             self.assertEqual(self.out(host, 'head -2 /etc/nftables.conf'),
                              '#!/usr/sbin/nft -f\n# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.\n')
             self.assertEqual(self.out(host, 'stat -c "%a %U %G" /etc/nftables.conf'), '755 root root\n')
             self.assertEqual(self.out(host, 'systemctl is-enabled nftables; systemctl is-active nftables'), 'enabled\nactive\n')
-            ruleset = self.out(host, 'nft list ruleset')
+            table = self.out(host, 'nft list table inet ofzhur')
             for line in ('type filter hook input priority filter; policy drop;',
-                         'type filter hook forward priority filter; policy drop;',
-                         'type filter hook output priority filter; policy accept;',
                          'iif "lo" accept', 'ct state established,related accept', 'ct state invalid drop',
                          'icmp type echo-request accept', 'icmpv6 type echo-request accept',
                          'tcp dport 22 accept comment "ssh"'):
-                self.assertIn(line, ruleset, host)
-            self.assertIn('nd-neighbor-solicit', ruleset)
+                self.assertIn(line, table, host)
+            self.assertIn('nd-neighbor-solicit', table)
+            # input alone: no forward chain to drop what others let through, no output chain
+            self.assertNotIn('hook forward', table, host)
+            self.assertNotIn('hook output', table, host)
+            # stopping nftables.service deletes the role's table alone; Arch's unit stays active once loaded
+            dropin = '/etc/systemd/system/nftables.service.d/ofzhur-firewall.conf'
+            self.assertEqual(self.out(host, f'stat -c "%a %U %G" {dropin}'), '644 root root\n')
+            self.assertEqual(self.out(host, f"grep -v '^#' {dropin}"),
+                             '[Service]\nRemainAfterExit=yes\nExecReload=\nExecReload=/usr/sbin/nft -f /etc/nftables.conf\n'
+                             'ExecStop=\nExecStop=-/usr/sbin/nft delete table inet ofzhur\n')
+            unit = self.out(host, 'systemctl show -p RemainAfterExit -p ExecReload -p ExecStop -p NeedDaemonReload nftables')
+            self.assertIn('RemainAfterExit=yes', unit)
+            self.assertIn('argv[]=/usr/sbin/nft delete table inet ofzhur ; ignore_errors=yes', unit)
+            self.assertIn('argv[]=/usr/sbin/nft -f /etc/nftables.conf', unit)
+            self.assertNotIn('flush ruleset', unit)
+            self.assertIn('NeedDaemonReload=no', unit)
             self.assertApplied(host)
         self.assertIn('tcp dport 8080 accept comment "http"', self.input('web-01'))
         self.assertNotIn('8080', self.input('db-01'))
 
+    def assertIptables(self, host):
+        """The role's chain, ending in its drop, jumped to first from INPUT; INPUT's policy untouched."""
+        for command in ('iptables', 'ip6tables'):
+            self.assertEqual(self.out(host, f'{command} -S INPUT'), '-P INPUT ACCEPT\n-A INPUT -j OFZHUR-INPUT\n', host)
+            chain = self.out(host, f'{command} -S OFZHUR-INPUT')
+            self.assertIn('-A OFZHUR-INPUT -p tcp -m tcp --dport 22 -m comment --comment ssh -j ACCEPT', chain)
+            self.assertTrue(chain.endswith('\n-A OFZHUR-INPUT -j DROP\n'), chain)
+            self.assertEqual(self.out(host, f'grep -c "^:" /etc/iptables/ofzhur-firewall.v{4 if command == "iptables" else 6}'),
+                             '1\n')
+        self.assertIn('--icmpv6-type 135', self.out(host, 'ip6tables -S OFZHUR-INPUT'))
+        # the role's unit loaded, refilling the chain alone
+        unit = self.out(host, 'systemctl show -p ExecReload -p NeedDaemonReload ofzhur-iptables')
+        self.assertIn('argv[]=/usr/sbin/iptables-restore -w --noflush /etc/iptables/ofzhur-firewall.v4 ;', unit)
+        self.assertIn('NeedDaemonReload=no', unit)
+        self.assertApplied(host, 'iptables')
+
     def assertApplied(self, host, backend='nftables'):
         """The stamp names the files in place."""
-        files = ['/etc/nftables.conf'] if backend == 'nftables' else ['/etc/iptables/rules.v4', '/etc/iptables/rules.v6']
+        files = ['/etc/nftables.conf'] if backend == 'nftables' else ['/etc/iptables/ofzhur-firewall.v4',
+                                                                     '/etc/iptables/ofzhur-firewall.v6']
         sums = [line.split()[0] for line in self.out(host, 'sha1sum ' + ' '.join(files)).splitlines()]
         self.assertEqual(self.out(host, 'cat /etc/ofzhur/firewall.applied'), ' '.join([backend, *sums]) + '\n')
         self.assertEqual(self.out(host, 'stat -c "%a %U %G" /etc/ofzhur/firewall.applied'), '644 root root\n')
@@ -611,10 +768,11 @@ class Scenario:
             self.assertLess(chain.index('iifname "eth1" drop'), chain.index('tcp dport 8081 accept'))
         else:
             for command, family in (('iptables', 4), ('ip6tables', 6)):
-                rules_ = self.out('db-01', f'{command} -S INPUT')
+                rules_ = self.out('db-01', f'{command} -S OFZHUR-INPUT')
                 prefix = '/32' if family == 4 else '/128'
-                self.assertIn(f'-A INPUT -s {a["client"][family]}{prefix} -i eth1 -m comment --comment app -j ACCEPT', rules_)
-                self.assertLess(rules_.index('-A INPUT -i eth1 -j DROP'), rules_.index('--dport 22 '))
+                self.assertIn(f'-A OFZHUR-INPUT -s {a["client"][family]}{prefix} -i eth1 -m comment --comment app -j ACCEPT',
+                              rules_)
+                self.assertLess(rules_.index('-A OFZHUR-INPUT -i eth1 -j DROP'), rules_.index('--dport 22 '))
         for family in (4, 6):
             with self.subTest(family=family):
                 # from the client: anything, ICMP too
@@ -760,52 +918,175 @@ class Scenario:
         self.assertNftables()
         self.assertUnchanged(self.play())
 
-    def test_09_reboot(self):
-        # nftables.service loads the ruleset at boot
-        docker('restart', self.names['db-01'])
+    def test_09_forwarding(self):
+        # Docker's way through db-01 passes: the role has no forward chain and leaves other tables alone
+        self.forwarding()
+        self.assertTrue(self.forwards())
+        self.assertUnchanged(self.play())
+        self.assertTrue(self.forwards())
+        # applied again (by an announcement), reloaded, restarted: the role's table replaced, the other one kept
+        self.announce('db-01', 'app', [{'proto': 'tcp', 'port': 8081}])
+        self.assertTrue(self.forwards())
+        self.announce('db-01', 'app', [])
+        for action in ('reload', 'restart'):
+            with self.subTest(action):
+                for host in HOSTS:
+                    self.out(host, f'systemctl {action} nftables')
+                self.assertIn('table ip foreign', self.tables('db-01'))
+                self.assertTrue(self.forwards())
+                self.assertNftables()
+        # stopped: the role's table alone goes
+        for host in HOSTS:
+            self.out(host, 'systemctl stop nftables')
+        self.assertEqual(self.tables('db-01'), ['table ip foreign'])
+        self.assertNotIn('table inet ofzhur', self.tables('web-01'))
+        self.assertTrue(self.forwards())
+        for host in HOSTS:
+            self.out(host, 'systemctl start nftables')
+        self.assertNftables()
+        self.assertSSH()
+        self.assertUnchanged(self.play())
+        # a run cut short with the drop-in written, not loaded: systemd has Debian's stop still; the next run loads it
+        self.out('db-01', 'mv /etc/systemd/system/nftables.service.d/ofzhur-firewall.conf /root/ && systemctl daemon-reload'
+                          ' && mv /root/ofzhur-firewall.conf /etc/systemd/system/nftables.service.d/')
+        self.assertIn('flush ruleset', self.out('db-01', 'systemctl show -p ExecStop nftables'))
+        self.assertUnchanged(self.play())
+        self.out('db-01', 'systemctl restart nftables')
+        self.assertIn('table ip foreign', self.tables('db-01'))
+        self.assertTrue(self.forwards())
+        self.assertNftables()
+
+    def test_10_reboot(self):
+        # nftables.service loads the ruleset at boot, Debian's on db-01, Arch's on web-01
+        for host in HOSTS:
+            docker('restart', self.names[host])
         self.ready()
         self.assertNftables()
         self.assertSSH()
         self.assertUnchanged(self.play())
 
-    def test_10_iptables(self):
+    def test_11_iptables(self):
+        # db-01 as ump leaves a server: its ruleset, Debian's nftables.service without the role's drop-in, whose
+        # stop would flush the iptables rules too; Docker's way through it again (the restart dropped it): its
+        # table stays
+        docker('exec', '-i', self.names['db-01'], 'sh', '-c',
+               'cat > /etc/nftables.conf && rm -r /etc/systemd/system/nftables.service.d && systemctl daemon-reload'
+               ' && nft -f /etc/nftables.conf', input=UMP_RULESET)
+        self.assertEqual(self.tables('db-01'), ['table inet filter'])
+        self.forwarding()
         self.firewall('iptables')
         self.play()
+        self.assertIn('table ip foreign', self.tables('db-01'))
+        self.assertTrue(self.forwards())
         for host in HOSTS:
             self.assertEqual([t for t in self.tables(host) if 'inet' in t], [], host)
             self.assertNotEqual(self.sh(host, 'test -e /etc/nftables.conf').returncode, 0)
+            self.assertNotEqual(self.sh(host, 'test -e /etc/systemd/system/nftables.service.d').returncode, 0)
             self.assertEqual(self.out(host, 'systemctl is-enabled nftables; systemctl is-active nftables; true'),
                              'disabled\ninactive\n')
             self.assertEqual(self.out(host, 'systemctl is-enabled ofzhur-iptables; systemctl is-active ofzhur-iptables'),
                              'enabled\nactive\n')
+            self.assertIptables(host)
             for command in ('iptables', 'ip6tables'):
-                rules = self.out(host, f'{command} -S INPUT')
-                self.assertTrue(rules.startswith('-P INPUT DROP\n'), rules)
-                self.assertIn('-A INPUT -p tcp -m tcp --dport 22 -m comment --comment ssh -j ACCEPT', rules)
-                self.assertTrue(self.out(host, f'{command} -S FORWARD').startswith('-P FORWARD DROP\n'))
-            self.assertIn('--icmpv6-type 135', self.out(host, 'ip6tables -S INPUT'))
-            self.assertApplied(host, 'iptables')
-        self.assertIn('--dport 8080 -m comment --comment http', self.out('web-01', 'iptables -S INPUT'))
-        self.assertNotIn('8080', self.out('db-01', 'iptables -S INPUT'))
+                self.assertEqual(self.out(host, f'{command} -S FORWARD'), '-P FORWARD ACCEPT\n')
+        self.assertIn('--dport 8080 -m comment --comment http', self.out('web-01', 'iptables -S OFZHUR-INPUT'))
+        self.assertNotIn('8080', self.out('db-01', 'iptables -S OFZHUR-INPUT'))
         self.assertSSH()
         self.assertTrue(self.http('web-01', '8080'))
         self.assertFalse(self.http('db-01', '8080'))
         self.assertUnchanged(self.play())
+        # Docker's chain in the table filter, FORWARD dropping but for it: the role's runs and reloads keep it
+        self.out('db-01', DOCKER_CHAIN)
+        self.assertDocker()
         self.interfaces('iptables')
+        self.assertDocker()
+        self.out('db-01', 'systemctl reload ofzhur-iptables')
+        self.assertDocker()
+        self.assertIptables('db-01')
         # ofzhur-iptables.service loads them at boot
         docker('restart', self.names['db-01'])
         self.ready()
-        self.assertTrue(self.out('db-01', 'iptables -S INPUT').startswith('-P INPUT DROP\n'))
+        self.assertIptables('db-01')
         self.assertSSH()
         self.assertUnchanged(self.play())
 
-    def test_11_back(self):
+    def test_12_from_0_4_0(self):
+        # the layout of 0.4.0, the role's rules right in INPUT, policies drop: one run puts the chain in place
+        self.old_layout('db-01')
+        self.assertSSH('db-01')
+        self.assertGreater(self.play()['db-01']['changed'], 0)
+        self.assertIptables('db-01')
+        for command in ('iptables', 'ip6tables'):
+            self.assertEqual(self.out('db-01', f'{command} -S FORWARD'), '-P FORWARD ACCEPT\n')
+        # 0.4.0's files go: rules.v4 and rules.v6 are iptables-persistent's, restored whole
+        for path in ('/etc/iptables/rules.v4', '/etc/iptables/rules.v6'):
+            self.assertNotEqual(self.sh('db-01', f'test -e {path}').returncode, 0, path)
+        self.out('db-01', 'systemctl reload ofzhur-iptables')
+        self.assertIptables('db-01')
+        self.assertSSH()
+        self.assertUnchanged(self.play())
+        # a run cut short: the files of this layout, the rules of 0.4.0
+        for family, command in ((4, 'iptables'), (6, 'ip6tables')):
+            docker('exec', '-i', self.names['db-01'], f'{command}-restore', input=old_rules(family))
+        self.assertEqual(self.play()['db-01']['changed'], 1)
+        self.assertIptables('db-01')
+        self.assertSSH()
+        self.assertUnchanged(self.play())
+        # a run cut short with the unit written, not loaded: systemd has 0.4.0's still; the next run loads it
+        docker('exec', '-i', self.names['db-01'], 'sh', '-c',
+               'cp /etc/systemd/system/ofzhur-iptables.service /root/'
+               ' && cat > /etc/systemd/system/ofzhur-iptables.service && systemctl daemon-reload'
+               ' && cat /root/ofzhur-iptables.service > /etc/systemd/system/ofzhur-iptables.service', input=OLD_UNIT)
+        self.assertIn('argv[]=/usr/sbin/iptables-restore /etc/iptables/rules.v4 ;',
+                      self.out('db-01', 'systemctl show -p ExecReload ofzhur-iptables'))
+        self.assertUnchanged(self.play())
+        self.out('db-01', 'systemctl reload ofzhur-iptables')
+        self.assertIptables('db-01')
+
+    def test_13_without_ipv6(self):
+        # a kernel booted with ipv6.disable=1 has no /proc/sys/net/ipv6, so no IPv6 rules: hidden here
+        self.out('db-01', 'ip6tables -w -D INPUT -j OFZHUR-INPUT && ip6tables -w -F OFZHUR-INPUT'
+                          ' && ip6tables -w -X OFZHUR-INPUT && mount -t tmpfs -o size=1m none /proc/sys/net')
+        try:
+            self.assertGreater(self.announce('db-01', 'app', [{'proto': 'tcp', 'port': 8081}])['changed'], 0)
+            self.assertIn('--dport 8081', self.out('db-01', 'iptables -S OFZHUR-INPUT'))
+            self.assertIn('--dport 8081', self.out('db-01', 'cat /etc/iptables/ofzhur-firewall.v6'))
+            self.assertNotEqual(self.sh('db-01', 'ip6tables -S OFZHUR-INPUT').returncode, 0)
+            self.out('db-01', 'systemctl reload ofzhur-iptables')
+            self.assertNotEqual(self.sh('db-01', 'ip6tables -S OFZHUR-INPUT').returncode, 0)
+            self.assertTrue(self.http('db-01', '8081'))
+            self.assertSSH()
+            self.assertUnchanged(self.play())
+        finally:
+            self.sh('db-01', 'umount /proc/sys/net')
+        # IPv6 back: its rules are put in place
+        self.assertEqual(self.play()['db-01']['changed'], 1)
+        self.assertIptables('db-01')
+        self.announce('db-01', 'app', [])
+        self.assertUnchanged(self.play())
+
+    def test_14_back(self):
+        # Docker's way and chain on db-01 again (the restart, then 0.4.0's table, dropped them): they stay; web-01
+        # as 0.4.0 left it (its rules let in no HTTP: the way through is checked before)
+        self.forwarding()
+        self.out('db-01', 'iptables -S DOCKER-TEST >/dev/null 2>&1 || { ' + DOCKER_CHAIN + '; }')
+        self.assertDocker()
+        self.old_layout('web-01')
         self.firewall()
         self.play()
         self.assertNftables()
+        self.assertIn('table ip foreign', self.tables('db-01'))
+        self.assertDocker()
         for host in HOSTS:
-            for path in ('/etc/systemd/system/ofzhur-iptables.service', '/etc/iptables/rules.v4', '/etc/iptables/rules.v6'):
+            for path in ('/etc/systemd/system/ofzhur-iptables.service', '/etc/iptables/ofzhur-firewall.v4',
+                         '/etc/iptables/ofzhur-firewall.v6', '/etc/iptables/rules.v4', '/etc/iptables/rules.v6'):
                 self.assertNotEqual(self.sh(host, f'test -e {path}').returncode, 0, path)
+        for command in ('iptables', 'ip6tables'):
+            # on db-01, the role's chain alone goes
+            self.assertEqual(self.out('db-01', f'{command} -S INPUT'), '-P INPUT ACCEPT\n')
+            self.assertNotEqual(self.sh('db-01', f'{command} -S OFZHUR-INPUT').returncode, 0)
+            # on web-01, 0.4.0's whole table is emptied, as 0.4.0 did
+            self.assertEqual(self.out('web-01', f'{command} -S'), '-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n')
         self.assertSSH()
         self.assertTrue(self.http('web-01', '8080'))
         self.assertUnchanged(self.play())

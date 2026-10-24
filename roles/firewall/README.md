@@ -16,11 +16,12 @@ other roles announce what they need.
 | Chain | |
 |---|---|
 | input | drop, but: loopback; the answers to the host's own connections; the ICMPv6 IPv6 needs (errors, neighbor and router discovery, MLD queries); on an interface an announcement polices, what its [policy](#interfaces) lets in, nothing else; ICMP echo, `firewall_icmp`; SSH; `firewall_rules` selected for the host, in order; the announcements, in name order |
-| forward | drop |
-| output | accept |
+| forward, output | not the role's: no chain of its own |
 
-By default that is ICMP and SSH alone. A host that forwards
-(containers, a VPN gateway) needs more than the role gives yet.
+By default that is ICMP and SSH alone. The kernel forwards nothing until
+software that turns forwarding on (Docker, a Kubernetes CNI, a VPN
+gateway) does, with rules of its own: see
+[Docker and Kubernetes](#docker-and-kubernetes).
 
 ## Variables
 
@@ -140,21 +141,53 @@ announcements for one interface let in from all their `accept_from`.
 
 | | nftables | iptables |
 |---|---|---|
-| Rules | `/etc/nftables.conf`, the table `inet ofzhur` | `/etc/iptables/rules.v4`, `rules.v6`, the table `filter` |
+| Rules | `/etc/nftables.conf`, the table `inet ofzhur` | `/etc/iptables/ofzhur-firewall.v4`, `.v6`, the chain `OFZHUR-INPUT` of the table `filter` |
 | Checked with | `nft -c -f` | `iptables-restore --test`, `ip6tables-restore --test` |
-| Applied with | `nft -f`: one transaction | `iptables-restore`, `ip6tables-restore`: one per family |
+| Applied with | `nft -f`: one transaction | `iptables-restore --noflush`, `ip6tables-restore --noflush`: one transaction per family |
 | Loaded at boot by | `nftables.service` | `ofzhur-iptables.service`, written by the role |
 
 - Each is installed when missing (`apt`, `pacman`).
 - nftables: the file replaces the table it held before, ump's or the
   distribution's (`inet filter`), and the role's own; other tables
   (containers', other tools') stay. A server ump installed ends up with
-  the role's table alone.
-- iptables: the role's rules are the whole table `filter`.
+  the role's table in place of ump's.
+- `nftables.service` touches the role's table alone, by a drop-in of the
+  role's, `/etc/systemd/system/nftables.service.d/ofzhur-firewall.conf`:
+  start, reload and restart load the file; stop deletes the table, where
+  the unit of Debian and Ubuntu flushes the whole ruleset. Once loaded,
+  the unit stays active, Arch's too.
+- iptables: the role's rules are the chain `OFZHUR-INPUT`, ending in a
+  drop, jumped to first from `INPUT`. `--noflush` refills that chain
+  alone; the other chains and the policies are not the role's. `INPUT`
+  keeps its policy, `ACCEPT` by default: a flush (`iptables -F`) opens
+  the host rather than shutting SSH out. IPv6 where the kernel has it,
+  none booted with `ipv6.disable=1` (ump's default).
+- The iptables files are the role's own: `rules.v4` and `rules.v6` are
+  iptables-persistent's, restored whole. `ofzhur-iptables.service` loads
+  after `netfilter-persistent.service` and Arch's `iptables.service`: a
+  whole table restored after the role's chain would drop it.
+- From 0.4.0, whose iptables rules were the whole table `filter` in
+  `rules.v4` and `rules.v6`, policies drop: the first run restores the
+  table whole, once, in one transaction, with the role's chain, the jump
+  and policies accept; 0.4.0's files go.
 - Switching removes what the role, or ump, put in place with the other
-  one. From iptables, the nftables ruleset is up first; from nftables,
-  stopping `nftables.service` empties the ruleset just before the
-  iptables rules are applied.
+  one, nothing else; the new rules are up first. From iptables, the
+  role's chain goes (0.4.0's whole table is emptied); from nftables,
+  `nftables.service` stops with the role's drop-in in place (a server
+  ump installed has none yet), deleting the role's table alone, and the
+  drop-in goes.
+
+## Docker and Kubernetes
+
+Their rules stay untouched: the role's are a table or a chain of its
+own, applied without flushing anything else, and forwarding is theirs.
+What comes in for the host itself passes the role's input: the ports of
+the host's own services (kubelet, an API server, a container on the host
+network) come by [announcement](#announcing-from-a-role) or in
+`firewall_rules`. What is forwarded to a container or a pod, a published
+port included, is theirs to police. With kube-proxy in IPVS mode the
+Service addresses are the host's own: the NodePorts, and the pod network
+(`accept_from` on the CNI's interface), come by announcement too.
 
 ## Safety
 
@@ -179,12 +212,14 @@ whole: a ruleset the backend refuses changes nothing.
 
 The checks, the announcements read and checked, the connection checked,
 the package, the rules written, checked and applied (when they changed,
-are not what was applied last, or are not in place), the service, then
-what the other backend left. What was applied last is
+are not what was applied last, or are not in place), then the service
+and what the other backend left. What was applied last is
 `/etc/ofzhur/firewall.applied`, the backend and the checksums of its
-files: rules written by a run cut short are applied by the next. A
-second run changes nothing. Check mode changes nothing; without
-`python3-apt` it leaves the package out.
+files: rules written by a run cut short are applied by the next, and a
+unit it wrote is loaded (`systemctl daemon-reload`). A second run
+changes nothing. Check mode changes nothing; without `python3-apt` it
+leaves the package out.
 
 Platforms: Ubuntu, Debian, Arch Linux; tested on Ubuntu 24.04 and
-Debian 13. Modules: `ansible.builtin` only.
+Debian 13, one host with the `nftables.service` of Arch Linux. Modules:
+`ansible.builtin` only.

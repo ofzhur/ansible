@@ -56,28 +56,48 @@
   vars:
     __firewall_check: "{{ [{'origin': 'SSH', 'name': '', 'rule': __firewall_ssh}] + __firewall_selected }}"
 
-# What is there: the package manager, the firewall in place (the role's,
-# ump's), what the role applied last, the announcements.
+# What is there: the package manager, IPv6 (none in a kernel booted with
+# ipv6.disable=1), the firewall in place (the role's, ump's), what the role
+# applied last, the announcements, a unit systemd has yet to reload (one a
+# run cut short wrote). With iptables, for each family: the role's chain in
+# place (jumped to, ending in its drop); else, where the role's unit is,
+# the layout of 0.4.0: its rules right in INPUT, or its file. The files of
+# 0.4.0 are rules.v4 and rules.v6, iptables-persistent's otherwise.
 - name: Look at the host
   ansible.builtin.shell: |
     command -v apt-get >/dev/null && echo apt
     dpkg-query -W -f '${Status}' python3-apt 2>/dev/null | grep -q ' installed$' && echo python3-apt
     command -v pacman >/dev/null && echo pacman
+    test -d /proc/sys/net/ipv6 && echo ipv6
     if command -v nft >/dev/null; then
       echo 'have nft'
       nft list tables 2>/dev/null
     fi
     if command -v iptables-restore >/dev/null && command -v ip6tables-restore >/dev/null; then
       echo 'have iptables'
-    {% if firewall_backend == 'iptables' %}
-      iptables -S INPUT 2>/dev/null | grep -qx -- '-P INPUT DROP' \
-        && ip6tables -S INPUT 2>/dev/null | grep -qx -- '-P INPUT DROP' && echo 'iptables drop'
-    {% endif %}
+      if [ {{ firewall_backend }} = iptables ] || [ -e /etc/systemd/system/ofzhur-iptables.service ]; then
+        for f in 4 6; do
+          c=iptables; [ $f = 4 ] || c=ip6tables
+          [ $f = 4 ] || [ -d /proc/sys/net/ipv6 ] || continue
+          if $c -w -C INPUT -j OFZHUR-INPUT >/dev/null 2>&1; then
+            $c -w -S OFZHUR-INPUT | tail -n 1 | grep -qx -- '-A OFZHUR-INPUT -j DROP' && echo "iptables in place $f"
+          elif [ -e /etc/systemd/system/ofzhur-iptables.service ]; then
+            $c -w -S INPUT 2>/dev/null | grep -q -- '--comment ssh -j ACCEPT$' \
+              || grep -qs '^# Managed by Ansible: ofzhur.ansible.firewall' /etc/iptables/rules.v$f \
+              && echo "iptables 0.4.0 $f"
+          fi
+        done
+      fi
     fi
+    for f in /etc/iptables/rules.v4 /etc/iptables/rules.v6; do
+      grep -qs '^# Managed by Ansible: ofzhur.ansible.firewall' $f && echo "0.4.0 file $f"
+    done
     grep -qs '^# Managed by Ansible: ofzhur.ansible.firewall' /etc/nftables.conf && echo 'nftables.conf role'
     grep -qs '^# written by UMP' /etc/nftables.conf && echo 'nftables.conf ump'
     test -f /etc/ofzhur/firewall.applied && echo "applied $(cat /etc/ofzhur/firewall.applied)"
     test -e /etc/systemd/system/ofzhur-iptables.service && echo ofzhur-iptables.service
+    systemctl show -p NeedDaemonReload --value nftables.service ofzhur-iptables.service 2>/dev/null \
+      | grep -qx yes && echo daemon-reload
     for f in /etc/ofzhur/firewall.d/*.json; do
       test -f "$f" && echo "announcement ${f##*/}"
     done

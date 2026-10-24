@@ -31,7 +31,7 @@ For each network `NAME` of the host:
 
 | | |
 |---|---|
-| Interface | `wg-NAME`: `wg-quick@wg-NAME`, enabled and started |
+| Interface | `wg-NAME`: `wg-quick@wg-NAME`, enabled and started, with `Table = off` (see [Interfaces and routes](#interfaces-and-routes)) |
 | Address | `address`, with the prefix of `cidr` (`10.0.0.5/24`) |
 | Port | see [Ports](#ports) |
 | Peers | the other hosts in `NAME` the [isolation](#isolation) lets through: `Endpoint` their `ansible_host` (a name resolved on the host) and port, `AllowedIPs` their address `/32`, `PersistentKeepalive = 25` |
@@ -39,16 +39,54 @@ For each network `NAME` of the host:
 
 - Networks are apart: hosts of two networks are no peers, and a host in
   both does not route between them.
-- A change reloads the interface (`wg syncconf` with
-  `wg-quick strip`), without an interruption; a new address restarts it.
-- A network the host left loses its interface: stopped, disabled, its
-  configuration and key removed. The role owns
-  `/etc/wireguard/wg-*.conf` and `wg-*.key`; other names there are not
-  touched.
+- A change goes onto the running interface, never restarts it: see
+  [Interfaces and routes](#interfaces-and-routes).
+- A network the host left loses its interface: stopped (deleted, when up
+  without its unit), disabled, its configuration and key removed. The
+  role owns `/etc/wireguard/wg-*.conf` and `wg-*.key`; other names there
+  are not touched.
 - A name is lower-case letters, digits, `.`, `_` and `-`, at most 12
   characters (an interface name has 15), as ump's; `cidr` an IPv4
   network of `/8` to `/30`, `address` one of its hosts. Anything else
   fails the run before any change.
+
+## Interfaces and routes
+
+`wg-quick@wg-NAME` brings the interface up with `Table = off`: wg-quick
+adds no routes, policy rules or firewall marks, whatever `AllowedIPs`
+holds. The interface's one route is the kernel's, to its network
+(`10.0.0.0/24` for `10.0.0.5/24`). Routes other software adds through
+the interface are its own: the role adds and deletes none.
+
+Such a route reaches the peers' addresses alone. WireGuard sends a
+packet to the peer whose `AllowedIPs` hold its destination, whatever the
+route's gateway, and the peers and their `AllowedIPs` are the role's:
+each run puts them back as configured. A route via a peer to another
+network carries nothing; software that routes other networks over the
+mesh (a Kubernetes CNI) encapsulates to the peers' addresses (VXLAN,
+IPIP over `wg-NAME`).
+
+A restart deletes the link, and with it every route through it, other
+software's too. The role never restarts a running interface; each run
+holds it against its configuration, whatever changed it (a new
+configuration, a person, a run cut short):
+
+- A new configuration, or peers, `AllowedIPs`, a port or key other than
+  configured: reloaded, `wg syncconf` with `wg-quick strip`, as the
+  unit's reload, without an interruption. An endpoint other than
+  configured is no reason: it follows a peer that roams.
+- Other IPv4 addresses than the configured one (a new address or
+  prefix): it goes on in place, then every other is deleted (with
+  `promote_secondaries`, so that the old address does not take the new
+  one with it). Routes through the interface stay; those from the old
+  address (`src`) go.
+- An absent interface starts: its unit is restarted, as after
+  `wg-quick down` by hand it is still active. One up without its unit
+  (`wg-quick up` by hand) is held in place as well; its unit brings it
+  up at the next boot.
+
+Nothing but a person restarts a running interface: `systemctl restart
+wg-quick@wg-NAME`.
 
 ## Ports
 
@@ -114,8 +152,10 @@ Six hosts of a network, `a` to `f`:
   apply. A host without groups lets in every peer, every protocol and
   port. WireGuard takes from a peer its own address alone (`AllowedIPs`),
   so an address on `wg-NAME` is that peer's.
-- Nothing is forwarded between peers (the firewall drops forward): a host
-  without groups joins no two groups.
+- A host without groups joins no two groups, forwarding on or off: on
+  the sender's interface a packet for a host isolated from it has no peer
+  to go to, and on the receiver's one from another host's address no peer
+  to come from.
 - Without the firewall (`wireguard_firewall: false`, or
   `ofzhur.ansible.firewall` not in place) the peers hold alone: hosts
   with groups and those without reach each other both ways.

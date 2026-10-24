@@ -204,6 +204,12 @@ vars:
 
 ISOLATION = 'wireguard_isolation: [foo, bar]\n'
 
+# Routes another program owns through an interface: one to the interface,
+# one via a peer. The tests check that they stay, not that they carry
+# anything: WireGuard sends to the peer whose AllowedIPs hold the
+# destination, whatever the gateway.
+ROUTES = {'default': ('192.0.2.0/24', '198.51.100.0/24'), 'lab.1': ('203.0.113.0/25', '203.0.113.128/25')}
+
 
 def private(networks, v050=False):
     """The private variables of a host file, as ump writes them."""
@@ -230,6 +236,11 @@ def one_way(sources, targets):
 def says(r, message):
     """Whether the run's output has message, however the callback wrapped it."""
     return ''.join(message.split()) in ''.join(r.stdout.split())
+
+
+def task(r, name):
+    """The output of the role's task name in the run."""
+    return r.stdout.split(f'TASK [ofzhur.ansible.wireguard : {name}]', 1)[1].split('TASK [', 1)[0]
 
 
 def untagged(value):
@@ -359,8 +370,25 @@ class Mesh(unittest.TestCase):
     def ifindex(self, host, network):
         return self.out(host, f'cat /sys/class/net/wg-{network}/ifindex').strip()
 
-    def ifindexes(self):
-        return {(h, n): self.ifindex(h, n) for h, networks in self.networks.items() for n in networks}
+    def ifindexes(self, hosts=HOSTS):
+        return {(h, n): self.ifindex(h, n) for h in hosts for n in self.networks[h]}
+
+    def inet(self, host, network):
+        return [a.split()[3] for a in self.out(host, f'ip -4 -o address show dev wg-{network}').splitlines()]
+
+    def add_routes(self, host, network, via):
+        """Puts the ROUTES of network through host's interface, the second via the peer via."""
+        to, gateway = ROUTES[network]
+        self.out(host, f'ip route replace {to} dev wg-{network}'
+                       f' && ip route replace {gateway} via {self.networks[via][network]} dev wg-{network}')
+        self.addCleanup(self.sh, host, f'ip route del {to}; ip route del {gateway}')
+
+    def assertRoutes(self, host, network, via):
+        """The ROUTES of network, through host's interface, are there."""
+        to, gateway = ROUTES[network]
+        routes = [r.split() for r in self.out(host, f'ip -4 route show dev wg-{network}').splitlines()]
+        self.assertIn([to, 'scope', 'link'], routes, host)
+        self.assertIn([gateway, 'via', self.networks[via][network]], routes, host)
 
     def cache(self, host):
         cache = os.path.join(self.infra.dir, '.cache', 'facts')
@@ -419,6 +447,10 @@ class Mesh(unittest.TestCase):
             for n, address in networks.items():
                 self.assertEqual(self.out(host, f'wg show wg-{n} listen-port').strip(), str(PORTS[n]))
                 self.assertIn(f' inet {address}/24 ', self.out(host, f'ip -4 -o address show dev wg-{n}'))
+                # wg-quick adds no routes: the network's, of the kernel, is the one
+                self.assertIn('\nTable = off\n', self.out(host, f'cat /etc/wireguard/wg-{n}.conf'))
+                self.assertEqual(self.out(host, f'ip -4 route show dev wg-{n}').split(),
+                                 f'{CIDRS[n]} proto kernel scope link src {address}'.split())
                 self.assertEqual(self.out(host, f'stat -c "%a %U" /etc/wireguard /etc/wireguard/wg-{n}.conf'
                                                 f' /etc/wireguard/wg-{n}.key').split('\n'),
                                  ['700 root', '600 root', '600 root', ''])
@@ -526,20 +558,55 @@ class Mesh(unittest.TestCase):
         self.assertPeers('b', 'default', ['a', 'e', 'f'])
 
     def test_09_address(self):
-        # a new address restarts the interface; its peers follow
+        # a new address, then a new prefix, go onto the running interface: the link stays, and with it the
+        # routes of others through it; its peers follow. f's wg-default is up without its unit (wg-quick up
+        # by hand): changed in place too, and left so.
+        self.out('f', 'systemctl stop wg-quick@wg-default && wg-quick up wg-default 2>&1')
+        self.add_routes('a', 'default', 'b')
+        before = self.ifindexes()
         self.networks['a'] = {'default': '10.0.0.11'}
         self.host_file('a')
+        # check mode tells, and changes nothing
+        r = self.play('--check')
+        self.assertIn('changed: [a]', task(r, 'Addresses of the running interfaces'))
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.1/24'])
+
         self.play()
-        self.assertIn(' inet 10.0.0.11/24 ', self.out('a', 'ip -4 -o address show dev wg-default'))
-        self.assertNotIn('10.0.0.1/', self.out('a', 'ip -4 -o address show dev wg-default'))
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.11/24'])
+        self.assertEqual(self.ifindexes(), before)
+        self.assertRoutes('a', 'default', 'b')
         self.assertIn('10.0.0.11/32', self.out('b', 'wg show wg-default allowed-ips'))
+        self.assertIn('10.0.0.11/32', self.out('f', 'wg show wg-default allowed-ips'))
+        self.assertEqual(self.sh('f', 'systemctl is-active wg-quick@wg-default').stdout.strip(), 'inactive')
+        self.assertReaches('b', '10.0.0.11')
+        self.assertReaches('a', '10.0.0.6')
+
+        # a new prefix (wireguard_networks in place of ump's), and back
+        self.infra.write('inventory/host_vars/a.yml',
+                         'wireguard_networks: {default: {address: 10.0.0.11, cidr: 10.0.0.0/16}}\n')
+        self.play()
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.11/16'])
+        self.assertEqual(self.ifindexes(), before)
+        self.assertRoutes('a', 'default', 'b')
+        os.remove(os.path.join(self.infra.dir, 'inventory', 'host_vars', 'a.yml'))
+        self.play()
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.11/24'])
+        self.assertEqual(self.ifindexes(), before)
+        self.assertRoutes('a', 'default', 'b')
         self.assertReaches('b', '10.0.0.11')
         self.assertUnchanged(self.play())
 
     def test_10_leave(self):
-        # f leaves its networks (wireguard_networks in place of ump's): its interfaces go, and its peers'
+        # f leaves its networks (wireguard_networks in place of ump's): its interfaces go, wg-default up without
+        # its unit too, and its peers'. The peers' interfaces stay, and the routes of others through them.
+        self.add_routes('a', 'default', 'b')
+        self.add_routes('c', 'lab.1', 'f')
+        before = self.ifindexes('abcde')
         self.infra.write('inventory/host_vars/f.yml', 'wireguard_networks: {}\n')
         self.play()
+        self.assertEqual(self.ifindexes('abcde'), before)
+        self.assertRoutes('a', 'default', 'b')
+        self.assertRoutes('c', 'lab.1', 'f')
         for n in ('default', 'lab.1'):
             self.assertNotEqual(self.sh('f', f'ip link show wg-{n}').returncode, 0)
             self.assertNotEqual(self.sh('f', f'ls /etc/wireguard/wg-{n}.conf').returncode, 0)
@@ -557,7 +624,11 @@ class Mesh(unittest.TestCase):
         self.assertUnchanged(self.play())
 
     def test_11_join(self):
-        # f back: its peers know it once it ran, and they ran after it
+        # f back: its peers know it once it ran, and they ran after it; their interfaces stay, and the
+        # routes of others through them
+        self.add_routes('a', 'default', 'b')
+        self.add_routes('c', 'lab.1', 'f')
+        before = self.ifindexes('abcde')
         os.remove(os.path.join(self.infra.dir, 'inventory', 'host_vars', 'f.yml'))
         r = self.play('--limit', 'c')
         self.assertTrue(says(r, 'wireguard: lab.1: f: no public key yet; it joins once it ran'), r.stdout)
@@ -567,6 +638,9 @@ class Mesh(unittest.TestCase):
         self.play()
         self.assertPeers('c', 'lab.1', ['f'])
         self.assertReaches('f', '10.0.1.3')
+        self.assertEqual(self.ifindexes('abcde'), before)
+        self.assertRoutes('a', 'default', 'b')
+        self.assertRoutes('c', 'lab.1', 'f')
         self.assertUnchanged(self.play())
 
     def test_12_outside_the_play(self):
@@ -610,6 +684,47 @@ class Mesh(unittest.TestCase):
         self.infra.write('inventory/group_vars/all.yml', ISOLATION)
         self.play()
         self.assertAnnounced('a', 'default', 'be')
+
+    def test_14_by_hand(self):
+        # what a person, or a run cut short, left on the interfaces is put right, in place: a's old address
+        # primary again beside its new one, a peer widened and another removed on b, wg-lab.1 down on c and
+        # wg-default on d, their units still active
+        self.add_routes('a', 'default', 'b')
+        before = self.ifindexes('ab')
+        self.out('a', 'ip address add 10.0.0.1/24 dev wg-default && ip address del 10.0.0.11/24 dev wg-default'
+                      ' && ip address add 10.0.0.11/24 dev wg-default')
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.1/24', '10.0.0.11/24'])
+        self.out('b', f'wg set wg-default peer {self.public_key("a", "default")} allowed-ips 10.0.0.11/32,192.0.2.0/24'
+                      f' && wg set wg-default peer {self.public_key("e", "default")} remove')
+        self.out('c', 'wg-quick down wg-lab.1 2>&1')
+        self.out('d', 'wg-quick down wg-default 2>&1')
+        self.assertEqual(self.out('d', 'systemctl is-active wg-quick@wg-default').strip(), 'active')
+
+        # check mode tells, and changes nothing
+        r = self.play('--check')
+        self.assertIn('changed: [a]', task(r, 'Addresses of the running interfaces'))
+        self.assertIn('changed: [b]', task(r, 'Peers of the running interfaces'))
+        self.assertIn('changed: [c]', task(r, 'Interfaces'))
+        self.assertIn('changed: [d]', task(r, 'Interfaces'))
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.1/24', '10.0.0.11/24'])
+        self.assertPeers('b', 'default', ['a', 'f'])
+        self.assertNotEqual(self.sh('d', 'ip link show wg-default').returncode, 0)
+
+        self.play()
+        self.assertEqual(self.inet('a', 'default'), ['10.0.0.11/24'])
+        self.assertIn(' src 10.0.0.11 ', self.out('a', 'ip -4 route get 10.0.0.2'))
+        self.assertEqual(self.ifindexes('ab'), before)
+        self.assertRoutes('a', 'default', 'b')
+        self.assertReaches('a', '10.0.0.2')
+        self.assertPeers('b', 'default', ['a', 'e', 'f'])
+        self.assertIn(f'{self.public_key("a", "default")}\t10.0.0.11/32\n',
+                      self.out('b', 'wg show wg-default allowed-ips'))
+        for host, n in (('c', 'lab.1'), ('d', 'default')):
+            self.assertEqual(self.out(host, f'systemctl is-active wg-quick@wg-{n}').strip(), 'active')
+            self.assertEqual(self.inet(host, n), [f'{self.networks[host][n]}/24'])
+        self.assertReaches('c', '10.0.1.6')
+        self.assertReaches('d', '10.0.0.3')
+        self.assertUnchanged(self.play())
 
 
 if __name__ == '__main__':

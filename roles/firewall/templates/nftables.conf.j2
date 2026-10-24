@@ -17,6 +17,10 @@ delete table inet filter
 table inet ofzhur
 delete table inet ofzhur
 
+# Input alone. A drop in any base chain is final: a forward chain with
+# policy drop would drop what Docker or kube-proxy let through. The kernel
+# forwards nothing until the software that turns it on does, with its own
+# policy.
 table inet ofzhur {
 	chain input {
 		type filter hook input priority 0; policy drop;
@@ -46,13 +50,5 @@ table inet ofzhur {
 		{{ rule(r, 'ip6' if source and ':' in source else 'ip', source) }}
 {%   endfor %}
 {% endfor %}
-	}
-
-	chain forward {
-		type filter hook forward priority 0; policy drop;
-	}
-
-	chain output {
-		type filter hook output priority 0; policy accept;
 	}
 }

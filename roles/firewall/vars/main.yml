@@ -170,6 +170,9 @@ __firewall_ssh_admits: >-
 # What the probe of the host found: a line each.
 __firewall_host: "{{ __firewall_probe.stdout_lines }}"
 
+# The IP families of the kernel: IPv6 unless booted with ipv6.disable=1.
+__firewall_families: "{{ [4, 6] if 'ipv6' in __firewall_host else [4] }}"
+
 # What is put in place, as /etc/ofzhur/firewall.applied records it once
 # applied: the backend and the checksums of its files.
 __firewall_applied: >-

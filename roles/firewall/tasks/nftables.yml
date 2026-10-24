@@ -50,15 +50,39 @@
     group: root
     mode: "0644"
 
+# nftables.service touches the role's table alone, other software's stay:
+# its stop deletes the role's table, where the unit of Debian and Ubuntu
+# flushes the whole ruleset. Written once the ruleset is in place, loaded
+# right after; by the next run, when this one is cut short in between.
+- name: Directory of the drop-in of nftables.service
+  ansible.builtin.file:
+    path: /etc/systemd/system/nftables.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Drop-in of nftables.service
+  ansible.builtin.template:
+    src: nftables.service.conf.j2
+    dest: /etc/systemd/system/nftables.service.d/ofzhur-firewall.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: __firewall_dropin
+
 - name: Load the ruleset at boot
   ansible.builtin.systemd_service:
     name: nftables
+    daemon_reload: "{{ __firewall_dropin is changed or 'daemon-reload' in __firewall_host }}"
     enabled: true
     state: started
   when: "'have nft' in __firewall_host or not ansible_check_mode"
 
 # Switching from iptables: after the ruleset above is in place, so that a
-# firewall is up all along.
+# firewall is up all along. The role's chain goes, other software's rules
+# stay; the layout of 0.4.0, where the whole table filter was the role's,
+# is emptied as 0.4.0 did.
 - name: Remove the iptables rules
   when: "'ofzhur-iptables.service' in __firewall_host"
   block:
@@ -68,27 +92,36 @@
         enabled: false
         state: stopped
 
-    - name: Empty the iptables tables
+    - name: Remove the role's chain
       ansible.builtin.shell: |
-        if iptables -V | grep -q nf_tables; then
-          for t in 'ip filter' 'ip6 filter'; do
-            nft list table $t >/dev/null 2>&1 && nft delete table $t
-          done
+        {% set c = 'iptables' if __firewall_family == 4 else 'ip6tables' %}
+        {% if 'iptables 0.4.0 ' ~ __firewall_family in __firewall_host %}
+        if {{ c }} -V | grep -q nf_tables; then
+          if nft list table {{ 'ip' if __firewall_family == 4 else 'ip6' }} filter >/dev/null 2>&1; then
+            nft delete table {{ 'ip' if __firewall_family == 4 else 'ip6' }} filter
+          fi
         else
-          for c in iptables ip6tables; do
-            printf '*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n' | $c-restore
-          done
+          printf '*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n' | {{ c }}-restore -w
         fi
+        {% else %}
+        while {{ c }} -w -D INPUT -j OFZHUR-INPUT 2>/dev/null; do :; done
+        if {{ c }} -w -S OFZHUR-INPUT >/dev/null 2>&1; then
+          {{ c }} -w -F OFZHUR-INPUT && {{ c }} -w -X OFZHUR-INPUT
+        fi
+        {% endif %}
+      loop: "{{ __firewall_families }}"
+      loop_control:
+        loop_var: __firewall_family
       changed_when: true
 
+    # Also 0.4.0's rules.v4 and rules.v6, where the role wrote them.
     - name: Remove the iptables files
       ansible.builtin.file:
         path: "{{ item }}"
         state: absent
-      loop:
-        - /etc/systemd/system/ofzhur-iptables.service
-        - /etc/iptables/rules.v4
-        - /etc/iptables/rules.v6
+      loop: >-
+        {{ ['/etc/systemd/system/ofzhur-iptables.service', '/etc/iptables/ofzhur-firewall.v4', '/etc/iptables/ofzhur-firewall.v6']
+           + __firewall_host | select('match', '0.4.0 file ') | map('regex_replace', '^0.4.0 file ', '') | list }}
 
     - name: Reload systemd
       ansible.builtin.systemd_service:

@@ -26,15 +26,20 @@
     group: root
     mode: "0755"
 
-# The whole table filter of each family, checked before it is put in place.
+# The role's chain of each family, checked before it is put in place; IPv6
+# where the kernel has it. Files of its own, not rules.v4 and rules.v6:
+# iptables-persistent restores those whole, which would drop the jump and
+# the other chains.
 - name: Rules
   ansible.builtin.template:
     src: iptables.rules.j2
-    dest: /etc/iptables/rules.v{{ __firewall_family }}
+    dest: /etc/iptables/ofzhur-firewall.v{{ __firewall_family }}
     owner: root
     group: root
     mode: "0644"
-    validate: "{{ 'iptables' if __firewall_family == 4 else 'ip6tables' }}-restore --test %s"
+    validate: >-
+      {{ ('iptables' if __firewall_family == 4 else 'ip6tables') ~ '-restore --test %s'
+         if __firewall_family in __firewall_families else omit }}
   loop: [4, 6]
   loop_control:
     loop_var: __firewall_family
@@ -49,46 +54,89 @@
     mode: "0644"
   register: __firewall_unit
 
-# Switching from nftables, the role's or ump's: stopping nftables.service
-# empties the whole ruleset, so before the rules are applied.
+# The role's chain alone: --noflush refills the chain the file declares in
+# one transaction and leaves the other chains (Docker's, kube-proxy's) and
+# the policies as they are; the jump from INPUT goes first, once. The
+# layout of 0.4.0 (the role's rules right in INPUT, policies drop, the
+# whole table the role's) gives way to this one in one transaction: the
+# table restored whole, policies accept. Also when the files are not what
+# was applied last (a run cut short), or the chain is not in place (a
+# flush, a reboot without the unit).
+- name: Apply the rules
+  ansible.builtin.shell: |
+    set -e
+    {% set c = 'iptables' if __firewall_family == 4 else 'ip6tables' %}
+    {% if 'iptables 0.4.0 ' ~ __firewall_family in __firewall_host %}
+    sed -e 's/^\*filter$/&\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]/' \
+        -e 's/^COMMIT$/-A INPUT -j OFZHUR-INPUT\n&/' /etc/iptables/ofzhur-firewall.v{{ __firewall_family }} | {{ c }}-restore -w
+    {% else %}
+    {{ c }}-restore -w --noflush /etc/iptables/ofzhur-firewall.v{{ __firewall_family }}
+    {{ c }} -w -C INPUT -j OFZHUR-INPUT >/dev/null 2>&1 || {{ c }} -w -I INPUT 1 -j OFZHUR-INPUT
+    {% endif %}
+  loop: "{{ __firewall_families }}"
+  loop_control:
+    loop_var: __firewall_family
+  when: >-
+    __firewall_rules_files is changed
+    or 'applied ' ~ __firewall_applied not in __firewall_host
+    or 'iptables in place ' ~ __firewall_family not in __firewall_host
+    or 'iptables 0.4.0 ' ~ __firewall_family in __firewall_host
+  changed_when: true
+
+# Switching from nftables, the role's or ump's: after the rules above are
+# in place, so that a firewall is up all along. Stopping nftables.service
+# would flush the whole ruleset, the chains above and Docker's with it,
+# but for the role's drop-in: it deletes the role's table alone.
 - name: Remove the nftables ruleset
   when: >-
     'nftables.conf role' in __firewall_host
     or 'nftables.conf ump' in __firewall_host
     or 'table inet ofzhur' in __firewall_host
   block:
+    - name: Directory of the drop-in of nftables.service
+      ansible.builtin.file:
+        path: /etc/systemd/system/nftables.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Drop-in of nftables.service
+      ansible.builtin.template:
+        src: nftables.service.conf.j2
+        dest: /etc/systemd/system/nftables.service.d/ofzhur-firewall.conf
+        owner: root
+        group: root
+        mode: "0644"
+
     - name: Stop loading the nftables ruleset at boot
       ansible.builtin.systemd_service:
         name: nftables
+        daemon_reload: true
         enabled: false
         state: stopped
 
     - name: Remove the nftables tables
       ansible.builtin.shell: |
         for t in 'inet ofzhur' 'inet filter'; do
-          nft list table $t >/dev/null 2>&1 && nft delete table $t
+          if nft list table $t >/dev/null 2>&1; then nft delete table $t; fi
         done
-        true
       changed_when: true
       register: __firewall_nftables_removed
 
-    - name: Remove /etc/nftables.conf
+    - name: Remove /etc/nftables.conf and the drop-in
       ansible.builtin.file:
-        path: /etc/nftables.conf
+        path: "{{ item }}"
         state: absent
+      loop:
+        - /etc/nftables.conf
+        - /etc/systemd/system/nftables.service.d/ofzhur-firewall.conf
 
-# Also when the files are not what was applied last (a run cut short).
-- name: Apply the rules
-  ansible.builtin.command: "{{ 'iptables' if __firewall_family == 4 else 'ip6tables' }}-restore /etc/iptables/rules.v{{ __firewall_family }}"
-  loop: [4, 6]
-  loop_control:
-    loop_var: __firewall_family
-  when: >-
-    __firewall_rules_files is changed
-    or 'applied ' ~ __firewall_applied not in __firewall_host
-    or 'iptables drop' not in __firewall_host
-    or __firewall_nftables_removed is changed
-  changed_when: true
+    # Its directory, when the drop-in was all it held.
+    - name: Remove the directory of the drop-in
+      ansible.builtin.command: rmdir --ignore-fail-on-non-empty /etc/systemd/system/nftables.service.d
+      args:
+        removes: /etc/systemd/system/nftables.service.d
 
 - name: Record what was applied
   ansible.builtin.copy:
@@ -98,10 +146,22 @@
     group: root
     mode: "0644"
 
+# The reload also drops the drop-in of nftables.service, when it went, and
+# loads the unit a run cut short wrote.
 - name: Load the rules at boot
   ansible.builtin.systemd_service:
     name: ofzhur-iptables
-    daemon_reload: "{{ __firewall_unit is changed }}"
+    daemon_reload: >-
+      {{ __firewall_unit is changed or __firewall_nftables_removed is changed
+         or 'daemon-reload' in __firewall_host }}
     enabled: true
     state: started
   when: "'ofzhur-iptables.service' in __firewall_host or not ansible_check_mode"
+
+# The files of 0.4.0, now that the rules of this layout are in place:
+# rules.v4 and rules.v6 are iptables-persistent's.
+- name: Remove the files of 0.4.0
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: "{{ __firewall_host | select('match', '0.4.0 file ') | map('regex_replace', '^0.4.0 file ', '') | list }}"

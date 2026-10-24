@@ -141,6 +141,13 @@
     enabled: false
   loop: "{{ __wireguard_left }}"
 
+# One up without its unit (wg-quick up by hand) outlives the stop.
+- name: Delete what remains of them
+  ansible.builtin.command: ip link delete dev wg-{{ item }}
+  args:
+    removes: /sys/class/net/wg-{{ item }}
+  loop: "{{ __wireguard_left }}"
+
 - name: Remove their configurations and keys
   ansible.builtin.file:
     path: /etc/wireguard/wg-{{ item.0 }}.{{ item.1 }}
@@ -338,7 +345,10 @@
 
 # The configuration is put together on the host, which adds the private key
 # from its file: a standard wg-quick configuration that never passes through
-# Ansible. Replaced only when it differs.
+# Ansible. Replaced only when it differs. Table = off: wg-quick adds no
+# routes, policy rules or marks, whatever AllowedIPs holds; the one route is
+# the kernel's, to the address's network. Software that routes over the
+# interface owns its routes.
 - name: Configurations
   ansible.builtin.shell:
     cmd: |
@@ -358,6 +368,7 @@
       [Interface]
       Address = {{ item.address }}/{{ item.prefix }}
       ListenPort = {{ item.port }}
+      Table = off
       {% for p in __wireguard_peers[item.name].peers %}
 
       # {{ p.name | regex_replace('[^A-Za-z0-9._-]', '_') }}
@@ -386,17 +397,75 @@
   failed_when: false
   check_mode: false
 
-# A new interface starts; a new address restarts it; other changes reload it:
-# wg syncconf with the stripped configuration, with no interruption.
+# A running interface is never restarted: that deletes the link, and the
+# kernel every route through it, other software's too. Changes go onto it
+# in place, whether its unit brought it up or wg-quick by hand.
+
+# Not the configured address alone (a new address or prefix, a run cut
+# short): it is added, then every other IPv4 address deleted.
+# promote_secondaries: the old address, deleted, takes no new one of its
+# subnet with it; an interface left without an address would lose every
+# route. Routes from the old address (src) go with it.
+- name: Addresses of the running interfaces
+  ansible.builtin.shell: |
+    {{ 'exit 0' if ansible_check_mode else '' }}
+    set -e
+    f={{ item.iface }}
+    a={{ item.address }}/{{ item.prefix }}
+    echo 1 > "/proc/sys/net/ipv4/conf/$f/promote_secondaries"
+    ip -4 address replace "$a" dev "$f"
+    for o in $(ip -4 -o address show dev "$f" | awk '{ print $4 }'); do
+      [ "$o" = "$a" ] || ip -4 address del "$o" dev "$f"
+    done
+  loop: "{{ __wireguard }}"
+  loop_control:
+    label: "{{ item.iface }}"
+    index_var: i
+  check_mode: false
+  when: >-
+    item.name in wireguard_public_keys and __wireguard_ip.results[i].rc == 0
+    and __wireguard_ip.results[i].stdout_lines | map('split') | map(attribute=3) | list
+        != [item.address ~ '/' ~ item.prefix]
+
+# Other changes: wg syncconf with the stripped configuration, as the unit's
+# reload, with no interruption. When the configuration changed, or the
+# interface differs from it in its port, key, peers or their AllowedIPs (a
+# change by hand, a run cut short); not in the endpoints, which follow a
+# peer that roams. Stripped first: a failed strip, an empty configuration,
+# would take every peer.
+- name: Peers of the running interfaces
+  ansible.builtin.shell: |
+    set -e
+    f={{ item.iface }}
+    c=$(wg-quick strip "$f")
+    {% if not __wireguard_conf.results[i].changed | default(false) %}
+    s() {
+      awk -F ' = ' '/^\[/{p=$0} $1=="PublicKey"{p=$2}
+        $1~/^(ListenPort|PrivateKey|PublicKey|AllowedIPs|PersistentKeepalive)$/{print p, $1, $2}' | sort
+    }
+    [ "$(printf '%s\n' "$c" | s)" != "$(wg showconf "$f" | s)" ] || exit 0
+    {% endif %}
+    {% if not ansible_check_mode %}
+    printf '%s\n' "$c" | wg syncconf "$f" /dev/stdin
+    {% endif %}
+    echo changed
+  loop: "{{ __wireguard }}"
+  loop_control:
+    label: "{{ item.iface }}"
+    index_var: i
+  register: __wireguard_sync
+  changed_when: __wireguard_sync.stdout == 'changed'
+  check_mode: false
+  when: item.name in wireguard_public_keys and __wireguard_ip.results[i].rc == 0
+
+# An absent interface starts: its unit restarted, as it may still be active
+# (wg-quick down by hand) and a start would do nothing. With no link there
+# is no route to lose. wg-quick up would fail on one up already.
 - name: Interfaces
   ansible.builtin.systemd_service:
     name: wg-quick@{{ item.iface }}
     enabled: true
-    state: >-
-      {{ 'started' if __wireguard_ip.results[i].rc != 0
-         else 'restarted' if (' inet ' ~ item.address ~ '/' ~ item.prefix ~ ' ') not in __wireguard_ip.results[i].stdout
-         else 'reloaded' if __wireguard_conf.results[i].changed | default(false)
-         else 'started' }}
+    state: "{{ 'restarted' if __wireguard_ip.results[i].rc != 0 else omit }}"
   loop: "{{ __wireguard }}"
   loop_control:
     label: "{{ item.iface }}"

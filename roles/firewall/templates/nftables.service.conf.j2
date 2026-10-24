@@ -1,0 +1,14 @@
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
+# nftables.service touches the role's table alone: start, reload and
+# restart load /etc/nftables.conf, which replaces it; stop deletes it,
+# where the unit of Debian and Ubuntu flushes the whole ruleset, the
+# tables of Docker and kube-proxy with it. Active once loaded: a oneshot
+# unit that is not (Arch's) runs ExecStop right after ExecStart.
+[Service]
+RemainAfterExit=yes
+ExecReload=
+ExecReload=/usr/sbin/nft -f /etc/nftables.conf
+ExecStop=
+ExecStop=-/usr/sbin/nft delete table inet ofzhur

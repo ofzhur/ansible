@@ -171,10 +171,12 @@ installs.
 
 The role `ofzhur.ansible.firewall` puts a host firewall in place from
 policy as code: input lets in loopback, the answers to the host's own
-connections, ICMP, SSH and what the policy names, nothing else; forward
-is dropped, output accepted. nftables by default (`firewall_backend:
-iptables` for iptables), IPv4 and IPv6. It takes over the firewall ump
-installs; see [roles/firewall](roles/firewall/README.md).
+connections, ICMP, SSH and what the policy names, nothing else. Input
+alone is the role's, in a table or chain of its own: forwarding, output
+and the rules of other software (Docker, Kubernetes) stay as they are.
+nftables by default (`firewall_backend: iptables` for iptables), IPv4
+and IPv6. It takes over the firewall ump installs; see
+[roles/firewall](roles/firewall/README.md).
 
 The policy goes into the inventory, each rule optionally targeted at
 hosts:
