@@ -1,0 +1,22 @@
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
+# The firewall's iptables rules, loaded before the network comes up. No
+# ExecStop: stopping the unit leaves them in place.
+[Unit]
+Description=Firewall (iptables, ofzhur.ansible.firewall)
+Wants=network-pre.target
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+ExecStart=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
+ExecReload=/usr/sbin/iptables-restore /etc/iptables/rules.v4
+ExecReload=/usr/sbin/ip6tables-restore /etc/iptables/rules.v6
+
+[Install]
+WantedBy=sysinit.target

@@ -1,0 +1,21 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# The firewall; see README.md and meta/argument_specs.yml. These go into the
+# inventory (group_vars, host_vars), where an announcement applying the
+# firewall finds them too.
+
+# nftables or iptables.
+firewall_backend: nftables
+
+# SSH is always let in, on this port; from the addresses and networks of
+# firewall_ssh_sources, when set, else from anywhere.
+firewall_ssh_port: 22
+# firewall_ssh_sources: [203.0.113.0/24, 2001:db8::/32]
+
+# ICMP echo (ping), IPv4 and IPv6. The ICMPv6 that IPv6 needs passes
+# regardless.
+firewall_icmp: true
+
+# What else gets in, each rule optionally targeted at hosts.
+firewall_rules: []

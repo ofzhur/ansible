@@ -1,0 +1,19 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# The networks of a host are ump's (ump_private_networks); wireguard_networks,
+# of the same shape, replaces them. See README.md and meta/argument_specs.yml.
+# These go into the inventory (group_vars, host_vars), where the other hosts
+# of a network see them.
+
+# Groups of the host are its Ansible groups named here, unless wireguard_groups
+# (a list for every network of the host, or a mapping of networks to lists)
+# names them. Hosts with groups sharing none have no tunnel; a host with
+# groups lets in new connections from the hosts sharing one alone.
+wireguard_isolation: []
+
+# Listen ports by network; a network not given gets one derived from its name.
+wireguard_ports: {}
+
+# Let the peers in through ofzhur.ansible.firewall.
+wireguard_firewall: true

@@ -1,0 +1,95 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# Check mode needs python3-apt; without it, the package is left out.
+- name: Install nftables
+  ansible.builtin.apt:
+    name: nftables
+    install_recommends: false
+    update_cache: true  # only when missing, with fresh lists: an installed system may have none
+  when: >-
+    'apt' in __firewall_host and 'have nft' not in __firewall_host
+    and ('python3-apt' in __firewall_host or not ansible_check_mode)
+
+# ansible.builtin has no pacman module (community.general has).
+- name: Install nftables
+  ansible.builtin.command: pacman -S --needed --noconfirm nftables
+  args:
+    creates: /usr/sbin/nft
+  when: "'pacman' in __firewall_host"
+
+# The whole of /etc/nftables.conf, checked before it is put in place.
+- name: Ruleset
+  ansible.builtin.template:
+    src: nftables.conf.j2
+    dest: /etc/nftables.conf
+    owner: root
+    group: root
+    mode: "0755"
+    validate: nft -c -f %s
+  register: __firewall_ruleset
+
+# One transaction: the table of ump (or of the distribution) goes, the
+# role's is replaced whole, nothing else is touched. Also when the file is
+# not what was applied last (a run cut short), or the table is not there:
+# a flush, a reboot without nftables.service.
+- name: Apply the ruleset
+  ansible.builtin.command: nft -f /etc/nftables.conf
+  when: >-
+    __firewall_ruleset is changed
+    or 'applied ' ~ __firewall_applied not in __firewall_host
+    or 'table inet ofzhur' not in __firewall_host
+    or 'table inet filter' in __firewall_host
+  changed_when: true
+
+- name: Record what was applied
+  ansible.builtin.copy:
+    content: "{{ __firewall_applied }}\n"
+    dest: /etc/ofzhur/firewall.applied
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Load the ruleset at boot
+  ansible.builtin.systemd_service:
+    name: nftables
+    enabled: true
+    state: started
+  when: "'have nft' in __firewall_host or not ansible_check_mode"
+
+# Switching from iptables: after the ruleset above is in place, so that a
+# firewall is up all along.
+- name: Remove the iptables rules
+  when: "'ofzhur-iptables.service' in __firewall_host"
+  block:
+    - name: Stop loading the iptables rules at boot
+      ansible.builtin.systemd_service:
+        name: ofzhur-iptables
+        enabled: false
+        state: stopped
+
+    - name: Empty the iptables tables
+      ansible.builtin.shell: |
+        if iptables -V | grep -q nf_tables; then
+          for t in 'ip filter' 'ip6 filter'; do
+            nft list table $t >/dev/null 2>&1 && nft delete table $t
+          done
+        else
+          for c in iptables ip6tables; do
+            printf '*filter\n:INPUT ACCEPT [0:0]\n:FORWARD ACCEPT [0:0]\n:OUTPUT ACCEPT [0:0]\nCOMMIT\n' | $c-restore
+          done
+        fi
+      changed_when: true
+
+    - name: Remove the iptables files
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: absent
+      loop:
+        - /etc/systemd/system/ofzhur-iptables.service
+        - /etc/iptables/rules.v4
+        - /etc/iptables/rules.v6
+
+    - name: Reload systemd
+      ansible.builtin.systemd_service:
+        daemon_reload: true

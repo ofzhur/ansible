@@ -1,0 +1,17 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+galaxy_info:
+  author: Oleg Zhurko
+  description: A WireGuard mesh over the private networks ump gives its servers, isolated by group.
+  license: MIT
+  min_ansible_version: "2.16"
+  platforms:
+    - name: Ubuntu
+      versions: [all]
+    - name: Debian
+      versions: [all]
+    - name: ArchLinux
+      versions: [all]
+
+dependencies: []

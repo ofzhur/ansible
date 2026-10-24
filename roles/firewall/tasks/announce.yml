@@ -1,0 +1,63 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# Another role announces what it needs let in:
+#
+#   - ansible.builtin.include_role:
+#       name: ofzhur.ansible.firewall
+#       tasks_from: announce
+#     vars:
+#       firewall_announce:
+#         name: app
+#         rules: [...]
+#         interfaces: {IFNAME: {accept_from: [...]}}   # optional
+#
+# No rules and no interfaces withdraw it. meta/argument_specs.yml (entry
+# point announce) has been checked before the first task.
+
+- name: Refuse an invalid announcement
+  ansible.builtin.assert:
+    that:
+      - firewall_announce.name | string is match(__firewall_re_name)
+      - __firewall_errors == []
+    fail_msg: >-
+      firewall: announcement {{ firewall_announce.name }}:
+      {{ ((['name: up to 32 letters, digits, _ . and -, not starting with . or -'] if firewall_announce.name | string is not match(__firewall_re_name) else [])
+          + __firewall_errors) | join('; ') }}
+    quiet: true
+  vars:
+    __firewall_check: >-
+      {%- set ns = namespace(checks=[]) -%}
+      {%- for r in firewall_announce.rules -%}
+      {%-   set ns.checks = ns.checks + [{'origin': 'rules[' ~ loop.index0 ~ ']', 'name': firewall_announce.name, 'rule': r}] -%}
+      {%- endfor -%}
+      {%- for i, p in (firewall_announce.interfaces | default({}, true)).items() -%}
+      {%-   set ns.checks = ns.checks + [{'origin': 'interfaces.' ~ i, 'name': firewall_announce.name, 'interface': i, 'policy': p}] -%}
+      {%- endfor -%}
+      {{ ns.checks }}
+
+- name: Directory of the announcements
+  ansible.builtin.file:
+    path: /etc/ofzhur/firewall.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: __firewall_announcement != {}
+
+- name: Announce {{ firewall_announce.name }}
+  ansible.builtin.copy:
+    content: "{{ {'name': firewall_announce.name} | combine(__firewall_announcement) | to_nice_json }}\n"
+    dest: /etc/ofzhur/firewall.d/{{ firewall_announce.name }}.json
+    owner: root
+    group: root
+    mode: "0644"
+  when: __firewall_announcement != {}
+  notify: ofzhur.ansible.firewall
+
+- name: Withdraw {{ firewall_announce.name }}
+  ansible.builtin.file:
+    path: /etc/ofzhur/firewall.d/{{ firewall_announce.name }}.json
+    state: absent
+  when: __firewall_announcement == {}
+  notify: ofzhur.ansible.firewall

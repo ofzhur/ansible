@@ -1,0 +1,42 @@
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+{% macro rules(r) %}
+{%   for source in ([none] if r.sources is none else r.sources | select('search', ':') if __firewall_family == 6 else r.sources | reject('search', ':')) %}
+{%     for port in r.ports %}
+-A INPUT{{ ' -i ' ~ r.interface if r.interface else '' }}{{ ' -s ' ~ source if source else '' }} -p {{ r.proto }} -m {{ r.proto }} --dport {{ port | replace('-', ':') }}{{ ' -m comment --comment "' ~ r.comment ~ '"' if r.comment else '' }} -j ACCEPT
+{%     endfor %}
+{%   endfor %}
+{% endmacro %}
+# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
+# {{ 'iptables' if __firewall_family == 4 else 'ip6tables' }}-restore /etc/iptables/rules.v{{ __firewall_family }} applies it; ofzhur-iptables.service loads it at boot.
+*filter
+:INPUT DROP [0:0]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [0:0]
+-A INPUT -i lo -j ACCEPT
+-A INPUT -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A INPUT -m conntrack --ctstate INVALID -j DROP
+{% if __firewall_family == 6 %}
+{#   destination unreachable, packet too big, time exceeded, parameter problem, MLD query, router and neighbor discovery #}
+{%   for type in [1, 2, 3, 4, 130, 134, 135, 136] %}
+-A INPUT -p ipv6-icmp -m icmp6 --icmpv6-type {{ type }} -j ACCEPT
+{%   endfor %}
+{% endif %}
+{% for interface, accepts in __firewall_interfaces | dictsort %}
+{%   for r in __firewall_policy if r.interface == interface %}
+{{ rules(r) -}}
+{%   endfor %}
+{%   for a in accepts %}
+{%     for source in (a.sources | select('search', ':') if __firewall_family == 6 else a.sources | reject('search', ':')) %}
+-A INPUT -i {{ interface }} -s {{ source }} -m comment --comment "{{ a.name }}" -j ACCEPT
+{%     endfor %}
+{%   endfor %}
+-A INPUT -i {{ interface }} -j DROP
+{% endfor %}
+{% if firewall_icmp %}
+-A INPUT -p {{ 'icmp -m icmp --icmp-type 8' if __firewall_family == 4 else 'ipv6-icmp -m icmp6 --icmpv6-type 128' }} -j ACCEPT
+{% endif %}
+{% for r in __firewall_policy if r.interface not in __firewall_interfaces %}
+{{ rules(r) -}}
+{% endfor %}
+COMMIT

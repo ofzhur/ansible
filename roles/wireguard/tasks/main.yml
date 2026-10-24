@@ -1,0 +1,425 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# meta/argument_specs.yml has been checked before the first task.
+
+# A host learns about the others from hostvars alone, which holds their
+# inventory variables and cached facts, not the play's variables or a role's
+# parameters: what it sees of itself there is what they see of it.
+- name: Refuse variables the other hosts cannot see
+  ansible.builtin.assert:
+    that: __wireguard_unseen == []
+    fail_msg: >-
+      wireguard: {{ __wireguard_unseen | join(', ') }} of {{ inventory_hostname }} set outside the inventory;
+      set it in group_vars or host_vars, where the other hosts see it
+    quiet: true
+  vars:
+    __wireguard_unseen: >-
+      {{ (['wireguard_networks'] if wireguard_networks | default(none)
+                                    != hostvars[inventory_hostname].wireguard_networks | default(none) else [])
+         + (['wireguard_groups'] if wireguard_groups | default(none)
+                                    != hostvars[inventory_hostname].wireguard_groups | default(none) else [])
+         + (['wireguard_isolation'] if wireguard_isolation != hostvars[inventory_hostname].wireguard_isolation | default([]) else [])
+         + (['wireguard_ports'] if wireguard_ports != hostvars[inventory_hostname].wireguard_ports | default({}) else []) }}
+
+# The networks of every host of the inventory (not only of --limit), each with
+# the host's address, the network's listen port and the host's groups there
+# (wireguard_groups where set, else its Ansible groups in its
+# wireguard_isolation), and the host's endpoint, an address or a name. Every
+# host reads the same, so two hosts agree on whether they are peers. An
+# invalid network is no network of its host, and an error of it.
+- name: Read the networks of the inventory
+  ansible.builtin.set_fact:
+    __wireguard_hosts: >-
+      {%- macro ipv4(s) -%}
+      {%-   if s is string and s is match('^[0-9]{1,3}([.][0-9]{1,3}){3}$') and s == s | trim
+              and s.split('.') | map('int') | max <= 255 -%}
+      {%-     set o = s.split('.') | map('int') | list -%}
+      {{-     ((o[0] * 256 + o[1]) * 256 + o[2]) * 256 + o[3] -}}
+      {%-   else -%}-1{%- endif -%}
+      {%- endmacro -%}
+      {%- set ns = namespace(hosts={}) -%}
+      {%- for h in groups['all'] -%}
+      {%-   set hv = hostvars[h] -%}
+      {%-   set networks = hv.wireguard_networks if hv.wireguard_networks is defined
+              else hv.ump_private_networks if hv.ump_private_networks is defined
+              else {hv.ump_private_network: {'address': hv.ump_private_address | default(none),
+                                             'cidr': hv.ump_private_cidr | default(none)}}
+                if hv.ump_private_network is defined
+              else {} -%}
+      {%-   set wg_groups = hv.wireguard_groups | default(none) -%}
+      {%-   set iso = hv.wireguard_isolation | default([]) -%}
+      {%-   set iso_ok = iso is sequence and iso is not string and iso is not mapping and not iso | reject('string') | list -%}
+      {%-   set ports = hv.wireguard_ports | default({}) -%}
+      {%-   set host = namespace(networks={}, errors=[] if networks is mapping else ['the networks are no mapping']) -%}
+      {%-   for n, v in (networks if networks is mapping else {}).items() -%}
+      {%-     set c = v.cidr.split('/') if v is mapping and v.cidr is defined and v.cidr is string else [] -%}
+      {%-     set net = ipv4(c[0]) | int if c | length == 2 else -1 -%}
+      {%-     set prefix = c[1] | int if c | length == 2 and c[1] is match('^[0-9]{1,2}$') and c[1] == c[1] | trim else -1 -%}
+      {%-     set size = 2 ** (32 - prefix) if 8 <= prefix <= 30 else 1 -%}
+      {%-     set address = v.address if v is mapping and v.address is defined else none -%}
+      {%-     set addr = ipv4(address) | int -%}
+      {%-     set g = wg_groups[n] if wg_groups is mapping and n in wg_groups
+                else wg_groups if wg_groups is not none and wg_groups is not mapping
+                else hv.group_names | default([]) | intersect(iso) if iso_ok else [] -%}
+      {%-     set port = ports[n] if ports is mapping and n in ports
+                else 51820 + ((n | string | hash('sha1'))[:8] | int(base=16)) % 1000 -%}
+      {%-     set cidr_ok = net >= 0 and 8 <= prefix <= 30 and net % size == 0 -%}
+      {%-     set errors = (
+                (['the name is not lower-case letters, digits, ".", "_" and "-", at most 12 characters (the interface is wg-NAME)']
+                  if not (n is string and n is match('^[a-z0-9][a-z0-9._-]{0,11}$') and n == n | trim) else [])
+                + (['cidr ' ~ (v.cidr | default('(none)') if v is mapping else '(none)') ~ ' is no IPv4 network of /8 to /30']
+                  if not cidr_ok else [])
+                + (['address ' ~ (address | default('(none)', true)) ~ ' is no host of its cidr']
+                  if addr < 0 or cidr_ok and (addr // size != net // size or addr in [net, net + size - 1]) else [])
+                + (['port ' ~ port ~ ' is no port']
+                  if port is not integer or not 1 <= port <= 65535 else [])
+                + (['wireguard_groups is no list of names, nor a mapping of networks to such lists']
+                  if g is string or g is mapping or g is not sequence or g | reject('string') | list else [])
+                + (['wireguard_isolation is no list of group names'] if not iso_ok else [])) -%}
+      {%-     if errors -%}
+      {%-       set host.errors = host.errors + errors | map('regex_replace', '^', 'network ' ~ n ~ ': ') | list -%}
+      {%-     else -%}
+      {%-       set host.networks = host.networks | combine({n: {
+                  'name': n, 'iface': 'wg-' ~ n, 'port': port, 'groups': g | unique | sort,
+                  'address': address.split('.') | map('int') | join('.'), 'addr': addr,
+                  'prefix': prefix, 'net': net, 'size': size,
+                  'cidr': [net // 16777216, net // 65536 % 256, net // 256 % 256, net % 256] | join('.') ~ '/' ~ prefix}}) -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set used = host.networks.values() | map(attribute='port') | list -%}
+      {%-   if used | unique | length != used | length -%}
+      {%-     set host.errors = host.errors + ['two networks, one port: ' ~ host.networks.values() | map(attribute='name') | zip(used)
+                                                | map('join', ' ') | join(', ') ~ '; set wireguard_ports'] -%}
+      {%-   endif -%}
+      {%-   set e = hv.ansible_host | default(h) -%}
+      {%-   set e4 = ipv4(e) | int -%}
+      {%-   set e6 = e is string and ':' in e and e is match('^[0-9A-Fa-f:.]+$') and e == e | trim -%}
+      {%-   set ename = e is string and e is match('^[A-Za-z0-9][A-Za-z0-9.-]*$') and e == e | trim -%}
+      {%-   set ns.hosts = ns.hosts | combine({h: {
+              'networks': host.networks, 'errors': host.errors, 'host': e,
+              'ip': e.split('.') | map('int') | join('.') if e4 >= 0 else e if e6 else none,
+              'name': e if e4 < 0 and not e6 and ename else none}}) -%}
+      {%- endfor -%}
+      {{ ns.hosts }}
+
+- name: Refuse invalid networks
+  ansible.builtin.assert:
+    that: __wireguard_hosts[inventory_hostname].errors == []
+    fail_msg: "wireguard: {{ inventory_hostname }}: {{ __wireguard_hosts[inventory_hostname].errors | join('; ') }}"
+    quiet: true
+
+- name: Select the networks of this host
+  ansible.builtin.set_fact:
+    __wireguard: "{{ __wireguard_hosts[inventory_hostname].networks.values() | sort(attribute='name') }}"
+
+# Interfaces wg-NAME whose network the host is no longer in. The role owns
+# /etc/wireguard/wg-*.conf and wg-*.key; other names there are not touched.
+- name: Look for /etc/wireguard
+  ansible.builtin.stat:
+    path: /etc/wireguard
+  register: __wireguard_dir
+
+- name: List the interfaces
+  ansible.builtin.find:
+    paths: /etc/wireguard
+    patterns: [wg-*.conf, wg-*.key]
+  register: __wireguard_found
+  when: __wireguard_dir.stat.isdir | default(false)
+
+- name: Select the networks this host left
+  ansible.builtin.set_fact:
+    __wireguard_left: >-
+      {{ __wireguard_found.files | default([]) | map(attribute='path') | map('basename')
+         | map('regex_replace', '^wg-|[.](conf|key)$', '') | unique | reject('in', __wireguard | map(attribute='name') | list)
+         | list }}
+
+- name: Stop the interfaces of networks left
+  ansible.builtin.systemd_service:
+    name: wg-quick@wg-{{ item }}
+    state: stopped
+    enabled: false
+  loop: "{{ __wireguard_left }}"
+
+- name: Remove their configurations and keys
+  ansible.builtin.file:
+    path: /etc/wireguard/wg-{{ item.0 }}.{{ item.1 }}
+    state: absent
+  loop: "{{ __wireguard_left | product(['conf', 'key']) | list }}"
+  loop_control:
+    label: wg-{{ item.0 }}.{{ item.1 }}
+
+# loop_var: the firewall's tasks and handlers loop over item.
+- name: Withdraw their ports from the firewall
+  ansible.builtin.include_role:
+    name: ofzhur.ansible.firewall
+    tasks_from: announce
+  vars:
+    firewall_announce:
+      name: wireguard-{{ __wireguard_network }}
+      rules: []
+  loop: "{{ __wireguard_left }}"
+  loop_control:
+    loop_var: __wireguard_network
+
+- name: Package and keys
+  when: __wireguard != []
+  block:
+    - name: Look at the package manager
+      ansible.builtin.shell: |
+        command -v apt-get >/dev/null && echo apt
+        dpkg-query -W -f '${Status}' python3-apt 2>/dev/null | grep -q ' installed$' && echo python3-apt
+        command -v pacman >/dev/null && echo pacman
+        command -v wg >/dev/null && echo have wg
+        true
+      check_mode: false
+      changed_when: false
+      register: __wireguard_probe
+
+    # Only when wg is missing, and then with fresh lists: an installed
+    # system may have none, under a lists directory as new as the system.
+    # Check mode needs python3-apt; without it, the package is left out.
+    - name: Package wireguard-tools (Debian, Ubuntu)
+      ansible.builtin.apt:
+        name: wireguard-tools
+        install_recommends: false  # a kernel module package; the kernel has it
+        update_cache: true
+      when: >-
+        'apt' in __wireguard_probe.stdout_lines and 'have wg' not in __wireguard_probe.stdout_lines
+        and ('python3-apt' in __wireguard_probe.stdout_lines or not ansible_check_mode)
+
+    # ansible.builtin has no pacman module (community.general has).
+    - name: Package wireguard-tools (Arch Linux)
+      ansible.builtin.command: pacman -S --needed --noconfirm wireguard-tools
+      args:
+        creates: /usr/bin/wg-quick
+      when: "'pacman' in __wireguard_probe.stdout_lines"
+
+    - name: Directory /etc/wireguard
+      ansible.builtin.file:
+        path: /etc/wireguard
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    # Once per network; the private key never leaves the host. Written aside
+    # first: an empty key file would stay.
+    - name: Private keys
+      ansible.builtin.shell: >-
+        umask 077 && wg genkey > /etc/wireguard/.{{ item.iface }}.key
+        && mv /etc/wireguard/.{{ item.iface }}.key /etc/wireguard/{{ item.iface }}.key
+      args:
+        creates: /etc/wireguard/{{ item.iface }}.key
+      loop: "{{ __wireguard }}"
+      loop_control:
+        label: "{{ item.iface }}"
+      no_log: true
+
+    # In check mode a new host has no key yet.
+    - name: Public keys
+      ansible.builtin.shell: wg pubkey < /etc/wireguard/{{ item.iface }}.key
+      loop: "{{ __wireguard }}"
+      loop_control:
+        label: "{{ item.iface }}"
+      register: __wireguard_pub
+      changed_when: false
+      failed_when: __wireguard_pub.rc != 0 and not ansible_check_mode
+      check_mode: false
+
+# For the other hosts' runs, --limit too: the fact cache keeps them. An empty
+# mapping takes a host that left every network out of its peers' configs.
+- name: Publish the public keys
+  ansible.builtin.set_fact:
+    wireguard_public_keys: >-
+      {%- set ns = namespace(keys={}) -%}
+      {%- for r in __wireguard_pub.results | default([]) if r.rc | default(1) == 0 -%}
+      {%-   set ns.keys = ns.keys | combine({r.item.name: r.stdout}) -%}
+      {%- endfor -%}
+      {{ ns.keys }}
+    cacheable: true
+
+# A peer whose key the fact cache lacks (expired, flushed) keeps the key of
+# this host's configuration: the public keys alone, by the peer's name.
+- name: Read the peers' keys of the configurations
+  ansible.builtin.shell: |
+    set -e
+    for n in {{ __wireguard | map(attribute='name') | map('quote') | join(' ') }}; do
+      test -f "/etc/wireguard/wg-$n.conf" || continue
+      awk -v n="$n" '/^# /{c=$2} /^\[Peer\]$/{p=c} /^PublicKey = /{print n, p, $3}' "/etc/wireguard/wg-$n.conf"
+    done
+  check_mode: false
+  changed_when: false
+  register: __wireguard_configured
+  when: __wireguard != []
+
+# Where this host reaches them: a peer's endpoint, and the address the
+# firewall lets in, are one address. A name that does not resolve would
+# fail the whole interface.
+- name: Resolve the host names of the peers
+  ansible.builtin.shell: |
+    for h in {{ __wireguard_names | map('quote') | join(' ') }}; do
+      { getent ahostsv4 "$h" || getent ahostsv6 "$h"; } | awk -v h="$h" 'NR == 1 {print h, $1}'
+    done
+  check_mode: false
+  changed_when: false
+  register: __wireguard_resolved
+  vars:
+    __wireguard_names: >-
+      {%- set ns = namespace(names=[]) -%}
+      {%- for h in groups['all'] if h != inventory_hostname and __wireguard_hosts[h].name
+                                    and __wireguard | map(attribute='name') | select('in', __wireguard_hosts[h].networks) | list -%}
+      {%-   set ns.names = ns.names + [__wireguard_hosts[h].name] -%}
+      {%- endfor -%}
+      {{ ns.names | unique | sort }}
+  when: __wireguard_names != []
+
+# After every host of the play published its keys (the linear strategy); the
+# other hosts' come from the fact cache, else from this host's configuration.
+# Two hosts of a network are peers unless both have groups there and share
+# none. New connections over the network: to a host without groups from all
+# its peers, to a host with groups from the peers sharing one.
+- name: Select the peers
+  ansible.builtin.set_fact:
+    __wireguard_peers: >-
+      {%- macro key_ok(k) -%}
+      {{- k is string and k is match('^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw480]=$') and k == k | trim -}}
+      {%- endmacro -%}
+      {%- set known = namespace(keys={}, ips={}) -%}
+      {%- for line in __wireguard_configured.stdout_lines | default([]) if line.split() | length == 3 -%}
+      {%-   set known.keys = known.keys | combine({line.split()[:2] | join(' '): line.split()[2]}) -%}
+      {%- endfor -%}
+      {%- for line in __wireguard_resolved.stdout_lines | default([]) if line.split() | length == 2 -%}
+      {%-   set known.ips = known.ips | combine({line.split()[0]: line.split()[1]}) -%}
+      {%- endfor -%}
+      {%- set ns = namespace(out={}) -%}
+      {%- for mine in __wireguard -%}
+      {%-   set p = namespace(peers=[], notes=[]) -%}
+      {%-   for h in groups['all'] | sort if h != inventory_hostname and mine.name in __wireguard_hosts[h].networks -%}
+      {%-     set peer = __wireguard_hosts[h] -%}
+      {%-     set theirs = peer.networks[mine.name] -%}
+      {%-     set keys = hostvars[h].wireguard_public_keys | default({}) -%}
+      {%-     set key = keys[mine.name] | default(none) if keys is mapping else none -%}
+      {%-     set key = key if key_ok(key) | bool
+                else known.keys[mine.name ~ ' ' ~ h] | default(none) if h is match('^[A-Za-z0-9._-]+$') else none -%}
+      {%-     set ip = peer.ip if peer.ip else known.ips[peer.name] | default(none) if peer.name else none -%}
+      {%-     if mine.groups and theirs.groups and not mine.groups | intersect(theirs.groups) -%}
+      {%-     elif theirs.addr // mine.size != mine.net // mine.size or theirs.addr in [mine.addr, mine.net, mine.net + mine.size - 1] -%}
+      {%-       set p.notes = p.notes + [h ~ ': address ' ~ theirs.address ~ ' is no other host of ' ~ mine.cidr] -%}
+      {%-     elif not peer.ip and not peer.name -%}
+      {%-       set p.notes = p.notes + [h ~ ': ansible_host ' ~ peer.host ~ ' is no address or host name'] -%}
+      {%-     elif not (ip is string and (ip is match('^[0-9]{1,3}([.][0-9]{1,3}){3}$') or ip is match('^[0-9A-Fa-f.]*:[0-9A-Fa-f:.]*$'))) -%}
+      {%-       set p.notes = p.notes + [h ~ ': ansible_host ' ~ peer.host ~ ' does not resolve'] -%}
+      {%-     elif not key_ok(key) | bool -%}
+      {%-       set p.notes = p.notes + [h ~ ': no public key yet; it joins once it ran'] -%}
+      {%-     else -%}
+      {%-       set p.peers = p.peers + [{'name': h, 'key': key, 'address': theirs.address, 'ip': ip,
+                                         'endpoint': ('[' ~ ip ~ ']' if ':' in ip else ip) ~ ':' ~ theirs.port,
+                                         'accept': not mine.groups or mine.groups | intersect(theirs.groups) | length > 0}] -%}
+      {%-     endif -%}
+      {%-   endfor -%}
+      {%-   set ns.out = ns.out | combine({mine.name: {'peers': p.peers, 'notes': p.notes,
+              'sources': p.peers | map(attribute='ip') | unique | sort,
+              'accept': p.peers | selectattr('accept') | map(attribute='address') | list}}) -%}
+      {%- endfor -%}
+      {{ ns.out }}
+
+- name: Peers left out
+  ansible.builtin.debug:
+    msg: "{{ __wireguard_notes }}"
+  vars:
+    __wireguard_notes: >-
+      {%- set ns = namespace(notes=[]) -%}
+      {%- for n, v in __wireguard_peers | dictsort -%}
+      {%-   set ns.notes = ns.notes + v.notes | map('regex_replace', '^', 'wireguard: ' ~ n ~ ': ') | list -%}
+      {%- endfor -%}
+      {{ ns.notes }}
+  when: __wireguard_notes != []
+
+# The configuration is put together on the host, which adds the private key
+# from its file: a standard wg-quick configuration that never passes through
+# Ansible. Replaced only when it differs.
+- name: Configurations
+  ansible.builtin.shell:
+    cmd: |
+      set -e
+      cd /etc/wireguard
+      umask 077
+      f={{ item.iface }}
+      awk -v key="$f.key" '{ print } $0 == "[Interface]" { if ((getline k < key) <= 0) exit 1; print "PrivateKey = " k }' > ".$f.conf"
+      if [ -f "$f.conf" ] && [ "$(sha256sum < ".$f.conf")" = "$(sha256sum < "$f.conf")" ]; then
+        rm ".$f.conf"
+      else
+        {{ 'rm ".$f.conf"' if ansible_check_mode else 'mv ".$f.conf" "$f.conf"' }}
+        echo changed
+      fi
+    stdin: |
+      # {{ item.iface }}: written by ofzhur.ansible.wireguard; edits are overwritten.
+      [Interface]
+      Address = {{ item.address }}/{{ item.prefix }}
+      ListenPort = {{ item.port }}
+      {% for p in __wireguard_peers[item.name].peers %}
+
+      # {{ p.name | regex_replace('[^A-Za-z0-9._-]', '_') }}
+      [Peer]
+      PublicKey = {{ p.key }}
+      Endpoint = {{ p.endpoint }}
+      AllowedIPs = {{ p.address }}/32
+      PersistentKeepalive = 25
+      {% endfor %}
+    stdin_add_newline: false
+  loop: "{{ __wireguard }}"
+  loop_control:
+    label: "{{ item.iface }}"
+  register: __wireguard_conf
+  changed_when: __wireguard_conf.stdout == 'changed'
+  check_mode: false
+  when: item.name in wireguard_public_keys
+
+- name: Look at the interfaces
+  ansible.builtin.command: ip -4 -o address show dev {{ item.iface }}
+  loop: "{{ __wireguard }}"
+  loop_control:
+    label: "{{ item.iface }}"
+  register: __wireguard_ip
+  changed_when: false
+  failed_when: false
+  check_mode: false
+
+# A new interface starts; a new address restarts it; other changes reload it:
+# wg syncconf with the stripped configuration, with no interruption.
+- name: Interfaces
+  ansible.builtin.systemd_service:
+    name: wg-quick@{{ item.iface }}
+    enabled: true
+    state: >-
+      {{ 'started' if __wireguard_ip.results[i].rc != 0
+         else 'restarted' if (' inet ' ~ item.address ~ '/' ~ item.prefix ~ ' ') not in __wireguard_ip.results[i].stdout
+         else 'reloaded' if __wireguard_conf.results[i].changed | default(false)
+         else 'started' }}
+  loop: "{{ __wireguard }}"
+  loop_control:
+    label: "{{ item.iface }}"
+    index_var: i
+  when: item.name in wireguard_public_keys
+
+# The port, open to the peers, and the policy of the interface: new
+# connections from the peers this host lets in. No peer, or no firewall
+# wanted: the announcement is withdrawn.
+- name: Announce the networks to the firewall
+  ansible.builtin.include_role:
+    name: ofzhur.ansible.firewall
+    tasks_from: announce
+  vars:
+    __wireguard_p: "{{ __wireguard_peers[__wireguard_network.name] }}"
+    firewall_announce: >-
+      {{ {'name': 'wireguard-' ~ __wireguard_network.name,
+          'rules': [{'proto': 'udp', 'port': __wireguard_network.port, 'sources': __wireguard_p.sources,
+                     'comment': 'peers of ' ~ __wireguard_network.iface}],
+          'interfaces': {__wireguard_network.iface: {'accept_from': __wireguard_p.accept}}}
+         if wireguard_firewall and __wireguard_p.peers else
+         {'name': 'wireguard-' ~ __wireguard_network.name, 'rules': []} }}
+  loop: "{{ __wireguard }}"
+  loop_control:
+    loop_var: __wireguard_network
+    label: wireguard-{{ __wireguard_network.name }}

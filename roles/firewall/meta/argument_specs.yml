@@ -1,0 +1,101 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+argument_specs:
+  main:
+    short_description: A host firewall, nftables or iptables, from policy as code
+    description:
+      - Input is dropped but for loopback, the answers to the host's own connections, ICMP, SSH, the rules of O(firewall_rules) selected for the host and those other roles announced (entry point C(announce)); on an interface an announcement polices, what its policy lets in. Output is accepted, forward dropped. IPv4 and IPv6.
+      - The ruleset is checked before it is applied, applied as a whole, and loaded at boot.
+      - An unknown key or a wrong type fails the run before any change; so do an invalid rule, a policy without SSH and one that would shut out the connection the run uses.
+      - The variables go into the inventory (group_vars, host_vars), where an announcement applying the firewall finds them too; a role parameter or a play variable fails the run.
+    author: Oleg Zhurko (@ofzhur)
+    options:
+      firewall_backend:
+        description:
+          - C(nftables) writes C(/etc/nftables.conf), loaded by C(nftables.service).
+          - C(iptables) writes C(/etc/iptables/rules.v4) and C(rules.v6), loaded by C(ofzhur-iptables.service).
+          - Switching removes what the role put in place with the other one.
+        type: str
+        choices: [nftables, iptables]
+        default: nftables
+      firewall_ssh_port:
+        description: The port SSH is let in on. Always let in; a policy without it fails the run.
+        type: int
+        default: 22
+      firewall_ssh_sources:
+        description:
+          - Addresses and networks (CIDR) SSH is let in from, IPv4 and IPv6.
+          - Not set, from anywhere. An empty list fails the run.
+        type: list
+        elements: str
+      firewall_icmp:
+        description: Let in ICMP echo (ping), IPv4 and IPv6. The ICMPv6 that IPv6 needs passes regardless.
+        type: bool
+        default: true
+      firewall_rules:
+        description: What else gets in, in order, after SSH and before the announcements.
+        type: list
+        elements: dict
+        default: []
+        options:
+          <<: &rule
+            proto:
+              description: Protocol.
+              type: str
+              choices: [tcp, udp]
+              required: true
+            port:
+              description: Destination port, 1-65535; a range C(N-M); or a list of them.
+              type: list
+              elements: str
+              required: true
+            sources:
+              description:
+                - Addresses and networks (CIDR) let in, IPv4 and IPv6.
+                - Not set, any. An empty list lets none in.
+              type: list
+              elements: str
+            interface:
+              description: Only on this input interface, such as C(wg-default). It need not exist yet.
+              type: str
+            comment:
+              description: Shown with the rule; up to 64 letters, digits, spaces, parentheses and C(_.,:;/+=@-).
+              type: str
+          hosts:
+            description:
+              - Host pattern, as for the C(hosts) of a play, matched against the whole inventory (not only C(--limit)).
+              - A list joins its patterns like C(a:b).
+              - Not set, the rule applies to every host.
+            type: list
+            elements: str
+
+  announce:
+    short_description: Announce what a role needs let in
+    description:
+      - Writes C(/etc/ofzhur/firewall.d/NAME.json) with the rules and interfaces, or removes it for none, and has the firewall applied at the end of the play where the role's firewall is in place; elsewhere the announcement waits for the role's first run.
+      - Announcements persist on the host, in name order after O(firewall_rules), until withdrawn.
+      - An unknown key, a wrong type, an invalid rule or interface fails the run before any change.
+    author: Oleg Zhurko (@ofzhur)
+    options:
+      firewall_announce:
+        description: The announcement.
+        type: dict
+        required: true
+        options:
+          name:
+            description: Its name, usually the role's; up to 32 letters, digits, C(_), C(.) and C(-). One announcement per name and host.
+            type: str
+            required: true
+          rules:
+            description: What the role needs let in, as the rules of O(firewall_rules) without O(firewall_rules[].hosts). An empty list and no interfaces withdraw the announcement.
+            type: list
+            elements: dict
+            required: true
+            options: *rule
+          interfaces:
+            description:
+              - 'Input interfaces the role polices, C({IFNAME: {accept_from: [...]}}): on C(IFNAME), the answers to the host''s own connections, the rules for C(IFNAME), and new connections of any protocol, ICMP included, from the addresses and networks of C(accept_from); everything else arriving there is dropped, ICMP echo and SSH too.'
+              - Other interfaces are not affected. Several announcements for one interface let in from all their C(accept_from).
+            type: dict
+            default: {}

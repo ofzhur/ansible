@@ -1,0 +1,27 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# An announcement (tasks_from: announce) notifies ofzhur.ansible.firewall.
+# The firewall is applied where the role has put it in place; elsewhere
+# the announcement waits for the role's first run.
+
+- name: Look for the firewall
+  ansible.builtin.command:
+    argv: [grep, -qs, '^# Managed by Ansible: ofzhur.ansible.firewall', /etc/nftables.conf, /etc/iptables/rules.v4]
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: __firewall_in_place
+  listen: ofzhur.ansible.firewall
+
+# The check the entry point main has before its first task.
+- name: Check the variables of the firewall
+  ansible.builtin.validate_argument_spec:
+    argument_spec: "{{ (lookup('ansible.builtin.file', role_path ~ '/meta/argument_specs.yml') | from_yaml).argument_specs.main.options }}"
+  when: __firewall_in_place.rc == 0
+  listen: ofzhur.ansible.firewall
+
+- name: Apply the firewall
+  ansible.builtin.include_tasks: "{{ role_path }}/tasks/main.yml"
+  when: __firewall_in_place.rc == 0
+  listen: ofzhur.ansible.firewall

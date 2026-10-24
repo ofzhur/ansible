@@ -1,0 +1,239 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# The role's own; evaluated where the tasks use them.
+
+# What a rule may hold. Values go into the ruleset as they are: nothing
+# else gets through. IPv6 addresses are checked in __firewall_errors.
+__firewall_re_port: '^[1-9][0-9]{0,4}(-[1-9][0-9]{0,4})?$'
+__firewall_re_v4: '^((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(/(3[0-2]|[12]?[0-9]))?$'
+__firewall_re_interface: '^[A-Za-z0-9_.-]{1,15}$'
+__firewall_re_comment: '^[A-Za-z0-9 _.,:;/()+=@-]{0,64}$'
+__firewall_re_name: '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}$'
+__firewall_re_file: '^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}\.json$'
+
+# SSH as a rule.
+__firewall_ssh: "{{ {'proto': 'tcp', 'port': firewall_ssh_port, 'sources': firewall_ssh_sources | default(none), 'comment': 'ssh'} }}"
+
+# What is wrong with the rules and the interface policies of
+# __firewall_check: [{origin, name, rule}], [{origin, name, interface, policy}].
+# An IPv6 address: groups of 1-4 hex digits, eight, or fewer and one '::';
+# the last two may be an IPv4 address.
+__firewall_errors: >-
+  {%- macro v6(s) -%}
+  {%-   set a = s.split('/') -%}
+  {%-   set h = a[0].split('::') -%}
+  {%-   set g = (h[0].split(':') if h[0] else []) + (h[1].split(':') if h | length == 2 and h[1] else []) -%}
+  {%-   set v4 = a[0].split(':')[-1] is match(__firewall_re_v4) -%}
+  {%-   set n = g | length + (1 if v4 else 0) -%}
+  {{-   ':' in a[0] and a | length <= 2 and h | length <= 2
+        and (g[:-1] if v4 else g) | reject('match', '^[0-9A-Fa-f]{1,4}$') | list == []
+        and (n <= 7 if h | length == 2 else n == 8)
+        and (a | length == 1 or a[1] is match('^(12[0-8]|1[01][0-9]|[1-9]?[0-9])$')) -}}
+  {%- endmacro -%}
+  {%- set ns = namespace(errors=[]) -%}
+  {%- for c in __firewall_check -%}
+  {%-   set e = namespace(l=[], lists=[]) -%}
+  {%-   if c.rule is not defined -%}
+  {%-     if not (c.interface is string and c.interface is match(__firewall_re_interface)) -%}
+  {%-       set e.l = ['interface: 1-15 letters, digits, _ . -'] -%}
+  {%-     endif -%}
+  {%-     if c.policy is mapping and c.policy.keys() | list == ['accept_from'] and c.policy.accept_from is not none -%}
+  {%-       set e.lists = [['accept_from', c.policy.accept_from]] -%}
+  {%-     else -%}
+  {%-       set e.l = e.l + ['{accept_from: [...]}, the addresses and networks let in'] -%}
+  {%-     endif -%}
+  {%-   elif c.rule is not mapping -%}
+  {%-     set e.l = ['not a mapping'] -%}
+  {%-   else -%}
+  {%-     set r = c.rule -%}
+  {%-     set unknown = r.keys() | difference(['proto', 'port', 'sources', 'interface', 'comment']) | sort -%}
+  {%-     if unknown -%}
+  {%-       set e.l = e.l + ['unknown ' ~ unknown | join(', ')] -%}
+  {%-     endif -%}
+  {%-     if r.proto | default(none) not in ['tcp', 'udp'] -%}
+  {%-       set e.l = e.l + ['proto: tcp or udp'] -%}
+  {%-     endif -%}
+  {%-     set ports = [r.port] if r.port is string or r.port is number else r.port | default(none) -%}
+  {%-     set p = namespace(ok=ports is sequence and ports is not string and ports is not mapping and ports | length > 0) -%}
+  {%-     for port in (ports if p.ok else []) -%}
+  {%-       set b = (port | string).split('-') -%}
+  {%-       if (port | string) is not match(__firewall_re_port) or b | map('int') | max > 65535
+                or (b | length == 2 and b[0] | int >= b[1] | int) -%}
+  {%-         set p.ok = false -%}
+  {%-       endif -%}
+  {%-     endfor -%}
+  {%-     if not p.ok -%}
+  {%-       set e.l = e.l + ['port: a port, 1-65535, a range N-M or a list of them'] -%}
+  {%-     endif -%}
+  {%-     if r.sources | default(none) is not none -%}
+  {%-       set e.lists = [['sources', r.sources]] -%}
+  {%-     endif -%}
+  {%-     if r.interface | default(none) is not none and not (r.interface is string and r.interface is match(__firewall_re_interface)) -%}
+  {%-       set e.l = e.l + ['interface: 1-15 letters, digits, _ . -'] -%}
+  {%-     endif -%}
+  {%-     if r.comment | default(none) is not none and not (r.comment is string and r.comment is match(__firewall_re_comment)) -%}
+  {%-       set e.l = e.l + ['comment: up to 64 letters, digits, spaces and _.,:;/()+=@-'] -%}
+  {%-     endif -%}
+  {%-   endif -%}
+  {%-   for key, value in e.lists -%}
+  {%-     set sources = [value] if value is string else value -%}
+  {%-     if sources is not sequence or sources is mapping -%}
+  {%-       set e.l = e.l + [key ~ ': a list of addresses and networks'] -%}
+  {%-     else -%}
+  {%-       for s in sources if not (s is string and (s is match(__firewall_re_v4) or ':' in s and v6(s) | bool)) -%}
+  {%-         set e.l = e.l + [key ~ ': ' ~ s ~ ' is no address or network'] -%}
+  {%-       endfor -%}
+  {%-     endif -%}
+  {%-   endfor -%}
+  {%-   for m in e.l -%}
+  {%-     set ns.errors = ns.errors + [c.origin ~ ': ' ~ m] -%}
+  {%-   endfor -%}
+  {%- endfor -%}
+  {{ ns.errors }}
+
+# The connection the run uses, [CLIENT, SERVER, SERVER_PORT, INTERFACE] as
+# the host sees it: SSH_CONNECTION ("CLIENT CLIENT_PORT SERVER SERVER_PORT")
+# on the first line, the interface holding SERVER among the addresses after
+# it (none, not found). Without one (a local run, another connection), [].
+# An IPv4 address of a dual-stack socket shows as ::ffff:a.b.c.d; the
+# firewall sees it as IPv4.
+__firewall_ssh_connection: >-
+  {%- set lines = (__firewall_connection.stdout | default('')).split('\n') -%}
+  {%- set c = lines[0].split() -%}
+  {%- set a = namespace(l=[]) -%}
+  {%- for x in [c[0], c[2]] if c | length == 4 -%}
+  {%-   set y = x.split('%')[0] -%}
+  {%-   set a.l = a.l + [y[7:] if y | lower is match('::ffff:[0-9.]+$') else y] -%}
+  {%- endfor -%}
+  {%- set dev = namespace(name=c[2].split('%')[1] if c | length == 4 and '%' in c[2] else none) -%}
+  {%- for l in lines[1:] if a.l and dev.name is none -%}
+  {%-   set f = l.split() -%}
+  {%-   if f | length > 3 and f[2] in ['inet', 'inet6'] and f[3].split('/')[0] | lower == a.l[1] | lower -%}
+  {%-     set dev.name = f[1].split('@')[0] -%}
+  {%-   endif -%}
+  {%- endfor -%}
+  {{ [a.l[0], a.l[1], c[3], dev.name] if a.l else [] }}
+
+# Whether the policy lets in the connection the run uses: on an interface
+# with a policy, its accept_from or a rule for the interface; elsewhere the
+# SSH rule.
+__firewall_ssh_admits: >-
+  {%- macro ipnum(a) -%}
+  {%-   set n = namespace(v=0, a=a) -%}
+  {%-   if ':' in a -%}
+  {%-     set t = a.rsplit(':', 1) -%}
+  {%-     if '.' in t[1] -%}
+  {%-       set o = t[1].split('.') | map('int') | list -%}
+  {%-       set n.a = t[0] ~ ':' ~ '%x:%x' | format(o[0] * 256 + o[1], o[2] * 256 + o[3]) -%}
+  {%-     endif -%}
+  {%-     set h = n.a.split('::') -%}
+  {%-     set head = h[0].split(':') if h[0] else [] -%}
+  {%-     set tail = h[1].split(':') if h | length > 1 and h[1] else [] -%}
+  {%-     for x in head + ['0'] * (8 - head | length - tail | length) + tail -%}
+  {%-       set n.v = n.v * 65536 + x | int(base=16) -%}
+  {%-     endfor -%}
+  {%-   else -%}
+  {%-     for x in a.split('.') -%}
+  {%-       set n.v = n.v * 256 + x | int -%}
+  {%-     endfor -%}
+  {%-   endif -%}
+  {{- n.v -}}
+  {%- endmacro -%}
+  {%- macro inside(address, sources) -%}
+  {%-   set v6 = ':' in address -%}
+  {%-   set bits = 128 if v6 else 32 -%}
+  {%-   set m = namespace(hit=sources is none) -%}
+  {%-   for s in ([sources] if sources is string else sources or []) if (':' in s) == v6 -%}
+  {%-     set net = s.split('/') -%}
+  {%-     set d = 2 ** (bits - (net[1] | int if net | length > 1 else bits)) -%}
+  {%-     if (ipnum(net[0]) | int) // d == (ipnum(address) | int) // d -%}
+  {%-       set m.hit = true -%}
+  {%-     endif -%}
+  {%-   endfor -%}
+  {{- m.hit -}}
+  {%- endmacro -%}
+  {%- set c = __firewall_ssh_connection -%}
+  {%- set ns = namespace(ok=true) -%}
+  {%- if c and c[3] in __firewall_interfaces -%}
+  {%-   set ns.ok = inside(c[0], __firewall_interfaces[c[3]] | map(attribute='sources') | flatten) | bool -%}
+  {%-   for r in __firewall_policy if r.interface == c[3] and r.proto == 'tcp' and inside(c[0], r.sources) | bool -%}
+  {%-     for p in r.ports if p.split('-')[0] | int <= c[2] | int <= p.split('-')[-1] | int -%}
+  {%-       set ns.ok = true -%}
+  {%-     endfor -%}
+  {%-   endfor -%}
+  {%- elif c -%}
+  {%-   set ns.ok = inside(c[0], __firewall_ssh.sources) | bool and c[2] | int == firewall_ssh_port | int -%}
+  {%- endif -%}
+  {{ ns.ok }}
+
+# What the probe of the host found: a line each.
+__firewall_host: "{{ __firewall_probe.stdout_lines }}"
+
+# What is put in place, as /etc/ofzhur/firewall.applied records it once
+# applied: the backend and the checksums of its files.
+__firewall_applied: >-
+  {{ 'nftables ' ~ __firewall_ruleset.checksum | default('') if firewall_backend == 'nftables'
+     else 'iptables ' ~ __firewall_rules_files.results | map(attribute='checksum', default='') | join(' ') }}
+
+# The announcements, in name order.
+__firewall_announcements: >-
+  {{ __firewall_read.results | default([]) | sort(attribute='item')
+     | map(attribute='content') | map('b64decode') | map('from_json') | list }}
+
+# The announced rules, in name order.
+__firewall_announced: >-
+  {%- set ns = namespace(rules=[]) -%}
+  {%- for a in __firewall_announcements -%}
+  {%-   for r in a.rules -%}
+  {%-     set ns.rules = ns.rules + [{'origin': '/etc/ofzhur/firewall.d/' ~ a.name ~ '.json rules[' ~ loop.index0 ~ ']', 'name': a.name, 'rule': r}] -%}
+  {%-   endfor -%}
+  {%- endfor -%}
+  {{ ns.rules }}
+
+# The announced interface policies, in name order.
+__firewall_announced_interfaces: >-
+  {%- set ns = namespace(policies=[]) -%}
+  {%- for a in __firewall_announcements -%}
+  {%-   for i, p in (a.interfaces | default({})).items() | sort -%}
+  {%-     set ns.policies = ns.policies + [{'origin': '/etc/ofzhur/firewall.d/' ~ a.name ~ '.json interfaces.' ~ i, 'name': a.name, 'interface': i, 'policy': p}] -%}
+  {%-   endfor -%}
+  {%- endfor -%}
+  {{ ns.policies }}
+
+# The policy the templates render: SSH, the selected rules, the announced
+# ones, each {proto, ports, sources (none: any), interface, comment}.
+__firewall_policy: >-
+  {%- set ns = namespace(rules=[]) -%}
+  {%- for c in [{'name': '', 'rule': __firewall_ssh}] + __firewall_selected + __firewall_announced -%}
+  {%-   set r = c.rule -%}
+  {%-   set ports = [r.port] if r.port is string or r.port is number else r.port -%}
+  {%-   set sources = r.sources | default(none) -%}
+  {%-   set ns.rules = ns.rules + [{
+          'proto': r.proto,
+          'ports': ports | map('string') | unique | list,
+          'sources': none if sources is none else ([sources] if sources is string else sources) | unique | list,
+          'interface': r.interface | default(none),
+          'comment': [c.name, r.comment | default('', true)] | select | join(': ') or none,
+        }] -%}
+  {%- endfor -%}
+  {{ ns.rules }}
+
+# The interfaces with a policy, {IFNAME: [{name, sources}]}, an entry per
+# announcement: on such an interface, the answers to the host's own
+# connections, the rules for it, and new connections from those sources.
+__firewall_interfaces: >-
+  {%- set ns = namespace(interfaces={}) -%}
+  {%- for c in __firewall_announced_interfaces -%}
+  {%-   set sources = c.policy.accept_from -%}
+  {%-   set ns.interfaces = ns.interfaces | combine({c.interface: ns.interfaces[c.interface] | default([])
+          + [{'name': c.name, 'sources': ([sources] if sources is string else sources) | unique | list}]}) -%}
+  {%- endfor -%}
+  {{ ns.interfaces }}
+
+# What an announcement puts on the host besides its name: its rules, and its
+# interfaces when it has any; {} withdraws it.
+__firewall_announcement: >-
+  {{ {} if firewall_announce.rules | length == 0 and not firewall_announce.interfaces | default({}, true)
+     else {'rules': firewall_announce.rules}
+          | combine({'interfaces': firewall_announce.interfaces} if firewall_announce.interfaces | default({}, true) else {}) }}

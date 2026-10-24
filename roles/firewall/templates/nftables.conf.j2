@@ -1,0 +1,58 @@
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+{% macro rule(r, family, source) -%}
+{{ 'iifname "' ~ r.interface ~ '" ' if r.interface else '' -}}
+{{ family ~ ' saddr ' ~ source ~ ' ' if source else '' -}}
+{{ r.proto }} dport {{ r.ports[0] if r.ports | length == 1 else '{ ' ~ r.ports | join(', ') ~ ' }' }} accept
+{{- ' comment "' ~ r.comment ~ '"' if r.comment else '' }}
+{%- endmacro -%}
+#!/usr/sbin/nft -f
+# Managed by Ansible: ofzhur.ansible.firewall. Changes here are overwritten.
+# nft -f /etc/nftables.conf applies it; nftables.service loads it at boot.
+
+# The table this file held before (ump's, the distribution's) goes; the
+# role's is replaced whole. One transaction, other tables untouched.
+table inet filter
+delete table inet filter
+table inet ofzhur
+delete table inet ofzhur
+
+table inet ofzhur {
+	chain input {
+		type filter hook input priority 0; policy drop;
+		iif lo accept
+		ct state established,related accept
+		ct state invalid drop
+		icmpv6 type { destination-unreachable, packet-too-big, time-exceeded, parameter-problem, mld-listener-query, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } accept
+{% for interface, accepts in __firewall_interfaces | dictsort %}
+{%   for r in __firewall_policy if r.interface == interface %}
+{%     for source in ([none] if r.sources is none else r.sources) %}
+		{{ rule(r, 'ip6' if source and ':' in source else 'ip', source) }}
+{%     endfor %}
+{%   endfor %}
+{%   for a in accepts %}
+{%     for source in a.sources %}
+		iifname "{{ interface }}" {{ 'ip6' if ':' in source else 'ip' }} saddr {{ source }} accept comment "{{ a.name }}"
+{%     endfor %}
+{%   endfor %}
+		iifname "{{ interface }}" drop
+{% endfor %}
+{% if firewall_icmp %}
+		icmp type echo-request accept
+		icmpv6 type echo-request accept
+{% endif %}
+{% for r in __firewall_policy if r.interface not in __firewall_interfaces %}
+{%   for source in ([none] if r.sources is none else r.sources) %}
+		{{ rule(r, 'ip6' if source and ':' in source else 'ip', source) }}
+{%   endfor %}
+{% endfor %}
+	}
+
+	chain forward {
+		type filter hook forward priority 0; policy drop;
+	}
+
+	chain output {
+		type filter hook output priority 0; policy accept;
+	}
+}

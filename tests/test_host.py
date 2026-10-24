@@ -63,7 +63,7 @@ class Infra:
     """A temporary infrastructure repository with the push template as ansible.cfg."""
 
     def __init__(self, files):
-        self.dir = tempfile.mkdtemp(prefix='ofzhur-ansible-test-')
+        self.dir = os.path.realpath(tempfile.mkdtemp(prefix='ofzhur-ansible-test-'))
         collection = os.path.join(self.dir, 'collections', 'ansible_collections', 'ofzhur')
         os.makedirs(collection)
         os.symlink(ROOT, os.path.join(collection, 'ansible'))

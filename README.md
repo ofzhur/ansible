@@ -11,6 +11,8 @@ used by every infrastructure that includes it. Servers are installed by
 | `ofzhur.ansible.facts`: cache plugin, facts in a storage that every machine running Ansible shares | [plugins/cache/facts.py](plugins/cache/facts.py) |
 | `ansible.cfg` for a control machine (Ansible runs there and reaches servers over SSH) | [config/push/ansible.cfg](config/push/ansible.cfg) |
 | `ofzhur.ansible.users`: role, OS users and groups with SSH keys and sudo, each targeted at hosts by a pattern | [roles/users](roles/users/README.md) |
+| `ofzhur.ansible.firewall`: role, a host firewall, nftables or iptables, from policy as code; other roles announce what they need | [roles/firewall](roles/firewall/README.md) |
+| `ofzhur.ansible.wireguard`: role, a WireGuard mesh over the private networks ump gives its servers, isolated by group | [roles/wireguard](roles/wireguard/README.md) |
 | `ofzhur.ansible.base`: playbook, the base of every server ump installs (the group `common`; the role `users`) | [playbooks/base.yml](playbooks/base.yml) |
 
 Requires ansible-core 2.16 or later. Plugins use Python's standard library
@@ -165,6 +167,79 @@ servers its `hosts:` matches: a group needs no playbook of its own.
 `ofzhur.ansible.base` matches `common`, the group of every server ump
 installs.
 
+## Firewall
+
+The role `ofzhur.ansible.firewall` puts a host firewall in place from
+policy as code: input lets in loopback, the answers to the host's own
+connections, ICMP, SSH and what the policy names, nothing else; forward
+is dropped, output accepted. nftables by default (`firewall_backend:
+iptables` for iptables), IPv4 and IPv6. It takes over the firewall ump
+installs; see [roles/firewall](roles/firewall/README.md).
+
+The policy goes into the inventory, each rule optionally targeted at
+hosts:
+
+```yaml
+# inventory/group_vars/common/firewall.yml
+firewall_rules:
+  - proto: tcp
+    port: [80, 443]
+    hosts: web
+```
+
+A role announces what it needs instead; the announcement stays on the
+host, applied by the firewall, until withdrawn with `rules: []`:
+
+```yaml
+- ansible.builtin.include_role:
+    name: ofzhur.ansible.firewall
+    tasks_from: announce
+  vars:
+    firewall_announce:
+      name: app
+      rules: [{proto: tcp, port: 8443}]
+```
+
+A rule is `proto` (`tcp`, `udp`), `port` (a port, `N-M` or a list),
+`sources` (addresses and networks; any when left out), `interface` and
+`comment`. An announcement may also police an interface, `interfaces:
+{IFNAME: {accept_from: [...]}}`: new connections arriving there come
+from those addresses alone, or by the rules for it. A policy without
+SSH, one that would shut out the connection the run uses, or one set
+outside the inventory (a role parameter, a play variable) fails the run
+before any change.
+
+## WireGuard mesh
+
+The role `ofzhur.ansible.wireguard` connects the servers over the
+private networks ump gives them (`ump_private_networks`): an interface
+`wg-NAME` per network of a host, its peers the other hosts of the
+inventory in that network, groups to keep hosts of one network apart.
+Each server generates its keys, and its public keys reach the others
+through the fact cache; each network is announced to the firewall: its
+port, open to the peers alone, and the connections its interface lets
+in. See [roles/wireguard](roles/wireguard/README.md).
+
+```yaml
+# playbooks/10-mesh.yml
+- name: Mesh
+  hosts: common
+  become: true
+  roles:
+    - ofzhur.ansible.wireguard
+```
+
+```yaml
+# inventory/group_vars/all/wireguard.yml: the hosts of foo and of bar apart
+wireguard_isolation: [foo, bar]
+```
+
+Hosts of different groups are no peers; a group's hosts reach the hosts
+without groups, which reach each other but not them.
+
+A server joins on its first run, and its peers know it once they ran
+after it: after adding a server, run on the whole fleet.
+
 ## Storages
 
 The facts in a storage and the host files in a storage take the URLs of
@@ -269,12 +344,17 @@ python3 tests/test_host_storage.py
 python3 tests/test_ump.py
 python3 tests/test_facts.py
 python3 tests/test_users.py
+python3 tests/test_firewall.py
+python3 tests/test_wireguard.py
+python3 tests/test_mesh.py
 ```
 
 They run the `ansible` commands on `PATH` against a repository laid out
 the way the template expects; for another ansible-core, put it first on
 `PATH`. With Docker, `test_host_storage.py` and `test_facts.py` also
 run the storages on containers (MinIO, Consul, Vault, sshd;
-[tests/storages.py](tests/storages.py)), and `test_users.py` runs the
-playbook `base` on containers (Ubuntu 24.04, Debian 13); without
-Docker, those parts are skipped.
+[tests/storages.py](tests/storages.py)), and the roles run on containers
+(Ubuntu 24.04, Debian 13): `test_users.py` the playbook `base`,
+`test_firewall.py` and `test_wireguard.py` their role, `test_mesh.py`
+both on six servers, isolated by group; without Docker, those parts are
+skipped.

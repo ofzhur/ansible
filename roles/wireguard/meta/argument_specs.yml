@@ -1,0 +1,44 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+argument_specs:
+  main:
+    short_description: A WireGuard mesh over the private networks of the hosts
+    description:
+      - One interface C(wg-NAME) per private network of the host, its peers the other hosts of the inventory in that network, isolated by group.
+      - The private key is generated on the host and never leaves it; the public key goes to the fact cache as C(wireguard_public_keys).
+      - The variables go into the inventory (group_vars, host_vars), where the other hosts see them; a role parameter or a play variable fails the run.
+      - A wrong type or an invalid network fails the run before any change.
+    author: Oleg Zhurko (@ofzhur)
+    options:
+      wireguard_networks:
+        description:
+          - 'The private networks of the host, C({NAME: {address: 10.0.0.5, cidr: 10.0.0.0/24}}), in place of ump''s.'
+          - Not set, those of ump, C(ump_private_networks), else C(ump_private_network), C(ump_private_address) and C(ump_private_cidr) of ump v0.5.0, else none.
+          - C(NAME) is lower-case letters, digits, C(.), C(_) and C(-), at most 12 characters (the interface is C(wg-NAME)); C(cidr) an IPv4 network of C(/8) to C(/30), C(address) one of its hosts.
+          - A network the host left loses its interface.
+        type: dict
+      wireguard_groups:
+        description:
+          - Groups of the host in place of its Ansible groups. A list holds for every network of the host, a mapping of networks to lists for the networks it names.
+          - Not set for a network, the host's groups there are its Ansible groups named in O(wireguard_isolation).
+          - Two hosts of a network are peers unless both have groups there and share none. A host with groups lets in new connections over the network from the peers sharing one alone (O(wireguard_firewall)).
+        type: raw
+      wireguard_isolation:
+        description:
+          - The Ansible groups that isolate their hosts, for the whole inventory (C(group_vars/all)).
+        type: list
+        elements: str
+        default: []
+      wireguard_ports:
+        description:
+          - 'Listen ports by network, C({NAME: PORT}).'
+          - A network not given listens on 51820 plus the first 32 bits of the SHA-1 of its name modulo 1000 (51820 to 52819), the same on every host.
+        type: dict
+        default: {}
+      wireguard_firewall:
+        description:
+          - Announce to C(ofzhur.ansible.firewall) the listen port of each network, open to the addresses of its peers, and the policy of its interface, new connections from the peers the host lets in.
+          - C(false) withdraws the announcements.
+        type: bool
+        default: true

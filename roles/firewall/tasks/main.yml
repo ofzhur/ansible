@@ -1,0 +1,158 @@
+# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
+# MIT License (see LICENSE)
+
+# meta/argument_specs.yml has been checked before the first task (by the
+# handler, when an announcement applies the firewall).
+
+# An announcement applies the firewall in the play of the role announcing,
+# where neither the parameters of this role nor the variables of another
+# play are: the policy comes from the inventory alone.
+- name: Refuse variables set outside the inventory
+  ansible.builtin.assert:
+    that: __firewall_unseen == []
+    fail_msg: >-
+      firewall: {{ __firewall_unseen | join(', ') }} of {{ inventory_hostname }} set outside the inventory;
+      set it in group_vars or host_vars, where an announcement applying the firewall finds it too
+    quiet: true
+  vars:
+    __firewall_unseen: >-
+      {{ (['firewall_backend'] if firewall_backend != hostvars[inventory_hostname].firewall_backend | default('nftables') else [])
+         + (['firewall_ssh_port'] if firewall_ssh_port != hostvars[inventory_hostname].firewall_ssh_port | default(22) else [])
+         + (['firewall_ssh_sources'] if firewall_ssh_sources | default(none)
+                                        != hostvars[inventory_hostname].firewall_ssh_sources | default(none) else [])
+         + (['firewall_icmp'] if firewall_icmp != hostvars[inventory_hostname].firewall_icmp | default(true) else [])
+         + (['firewall_rules'] if firewall_rules != hostvars[inventory_hostname].firewall_rules | default([]) else []) }}
+
+# A rule applies when it has no hosts or its pattern matches this host,
+# matched against the whole inventory as in ofzhur.ansible.users.
+- name: Select the rules of this host
+  ansible.builtin.set_fact:
+    __firewall_selected: >-
+      {%- set ns = namespace(selected=[]) -%}
+      {%- for r in firewall_rules -%}
+      {%-   if r.hosts | default(none) is none
+              or inventory_hostname in query('ansible.builtin.inventory_hostnames', *([r.hosts] if r.hosts is string else r.hosts)) -%}
+      {%-     set ns.selected = ns.selected + [{
+                'origin': 'firewall_rules[' ~ loop.index0 ~ ']', 'name': '',
+                'rule': r | dict2items | rejectattr('key', 'eq', 'hosts') | items2dict}] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.selected }}
+
+# SSH is always let in: a policy without it would shut everyone out.
+- name: Refuse a policy without SSH
+  ansible.builtin.assert:
+    that:
+      - (firewall_ssh_port | string) is match('^[1-9][0-9]{0,4}$') and firewall_ssh_port | int <= 65535
+      - __firewall_ssh.sources is none or __firewall_ssh.sources | length > 0
+    fail_msg: "firewall: no SSH: firewall_ssh_port is a port, 1-65535, and firewall_ssh_sources, when set, names an address or network"
+    quiet: true
+
+- name: Refuse an invalid rule
+  ansible.builtin.assert:
+    that: __firewall_errors == []
+    fail_msg: "firewall: {{ __firewall_errors | join('; ') }}"
+    quiet: true
+  vars:
+    __firewall_check: "{{ [{'origin': 'SSH', 'name': '', 'rule': __firewall_ssh}] + __firewall_selected }}"
+
+# What is there: the package manager, the firewall in place (the role's,
+# ump's), what the role applied last, the announcements.
+- name: Look at the host
+  ansible.builtin.shell: |
+    command -v apt-get >/dev/null && echo apt
+    dpkg-query -W -f '${Status}' python3-apt 2>/dev/null | grep -q ' installed$' && echo python3-apt
+    command -v pacman >/dev/null && echo pacman
+    if command -v nft >/dev/null; then
+      echo 'have nft'
+      nft list tables 2>/dev/null
+    fi
+    if command -v iptables-restore >/dev/null && command -v ip6tables-restore >/dev/null; then
+      echo 'have iptables'
+    {% if firewall_backend == 'iptables' %}
+      iptables -S INPUT 2>/dev/null | grep -qx -- '-P INPUT DROP' \
+        && ip6tables -S INPUT 2>/dev/null | grep -qx -- '-P INPUT DROP' && echo 'iptables drop'
+    {% endif %}
+    fi
+    grep -qs '^# Managed by Ansible: ofzhur.ansible.firewall' /etc/nftables.conf && echo 'nftables.conf role'
+    grep -qs '^# written by UMP' /etc/nftables.conf && echo 'nftables.conf ump'
+    test -f /etc/ofzhur/firewall.applied && echo "applied $(cat /etc/ofzhur/firewall.applied)"
+    test -e /etc/systemd/system/ofzhur-iptables.service && echo ofzhur-iptables.service
+    for f in /etc/ofzhur/firewall.d/*.json; do
+      test -f "$f" && echo "announcement ${f##*/}"
+    done
+    true
+  check_mode: false
+  changed_when: false
+  register: __firewall_probe
+
+- name: Read the announcements
+  ansible.builtin.slurp:
+    src: /etc/ofzhur/firewall.d/{{ item }}
+  loop: "{{ __firewall_host | select('match', 'announcement ') | map('regex_replace', '^announcement ', '') | sort }}"
+  register: __firewall_read
+
+- name: Refuse an invalid announcement
+  ansible.builtin.assert:
+    that:
+      - item.item is match(__firewall_re_file)
+      - __announcement is mapping and __announcement.keys() | sort in [['name', 'rules'], ['interfaces', 'name', 'rules']]
+      - __announcement.name == item.item[:-5]
+      - __announcement.rules is sequence and __announcement.rules is not string and __announcement.rules is not mapping
+      - __announcement.interfaces | default({}) is mapping
+    fail_msg: >-
+      firewall: /etc/ofzhur/firewall.d/{{ item.item }} is no announcement:
+      {"name": NAME, "rules": [...], "interfaces": {...}} in NAME.json, interfaces optional
+    quiet: true
+  vars:
+    __announcement: "{{ item.content | b64decode | from_json }}"
+  loop: "{{ __firewall_read.results }}"
+  loop_control:
+    label: "{{ item.item }}"
+
+- name: Refuse an invalid announced rule
+  ansible.builtin.assert:
+    that: __firewall_errors == []
+    fail_msg: "firewall: {{ __firewall_errors | join('; ') }}"
+    quiet: true
+  vars:
+    __firewall_check: "{{ __firewall_announced + __firewall_announced_interfaces }}"
+
+# As the user the run logs in as: sudo drops SSH_CONNECTION. The addresses
+# tell the interface it comes in on.
+- name: Look at the connection
+  ansible.builtin.shell: |
+    echo "$SSH_CONNECTION"
+    ip -o address show 2>/dev/null
+    true
+  become: false
+  check_mode: false
+  changed_when: false
+  failed_when: false
+  register: __firewall_connection
+
+- name: Refuse a policy that shuts out this connection
+  ansible.builtin.assert:
+    that: __firewall_ssh_admits | bool
+    fail_msg: >-
+      firewall:
+      {{ 'the policy of ' ~ __connection[3] ~ ', accept_from '
+           ~ (__firewall_interfaces[__connection[3]] | map(attribute='sources') | flatten | unique | join(', ') or 'none')
+         if __connection[3] in __firewall_interfaces
+         else 'the SSH rule, port ' ~ firewall_ssh_port ~ ' from '
+           ~ ([__firewall_ssh.sources] | flatten | join(', ') if __firewall_ssh.sources is not none else 'anywhere') }},
+      would shut out this connection, from {{ __connection[0] }} to port {{ __connection[2] }}
+    quiet: true
+  vars:
+    __connection: "{{ __firewall_ssh_connection + ['?'] * 4 }}"
+
+- name: Directory /etc/ofzhur
+  ansible.builtin.file:
+    path: /etc/ofzhur
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Apply with {{ firewall_backend }}
+  ansible.builtin.include_tasks: "{{ firewall_backend }}.yml"
