@@ -1,9 +1,0 @@
-# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
-# MIT License (see LICENSE)
-#
-# The run list of the group common, which every server ump installs is in.
-# An infrastructure repository overrides it with its own playbooks/common.yml.
-#
-#   ansible-playbook ofzhur.ansible.common
-
-- import_playbook: ofzhur.ansible.base

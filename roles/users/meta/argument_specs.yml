@@ -117,6 +117,7 @@ argument_specs:
       users_protected:
         description:
           - Users that no entry may manage.
-          - Default C(root) and C(ansible_user), when set.
+          - Default C(root) and C(ump_admin), when set; the server's administrator, whom ump's own runs log in as.
+          - Not the user a person logs in as (C(-u)); their own entry manages them.
         type: list
         elements: str

@@ -4,8 +4,7 @@ OS groups and users from variables: accounts, SSH keys, sudo. Each
 entry applies to every host of the play, or to the hosts its `hosts`
 pattern selects.
 
-It runs in the playbook `ofzhur.ansible.base`, and so in
-`ofzhur.ansible.common`, or on its own:
+It runs in the playbook `ofzhur.ansible.base`, or on its own:
 
 ```yaml
 - hosts: all
@@ -30,7 +29,7 @@ Ansible does not merge lists: `users` of a more specific group replaces
 | `users` | `[]` | Users, below. |
 | `users_groups` | `[]` | OS groups: `name` (required), `gid`, `system`, `state`, `hosts`. |
 | `users_shell` | `/bin/bash` | Shell of a user without `shell`. |
-| `users_protected` | `root` and `ansible_user` | See [Safety](#safety). |
+| `users_protected` | `root` and `ump_admin`, when set | See [Safety](#safety). |
 
 A user:
 
@@ -119,10 +118,12 @@ Groups such as `sudo` or `wheel` are not touched; `groups` adds them.
 ## Safety
 
 The run fails before any change when an entry selected for a host names
-a user of `users_protected`: root or the user Ansible connects as
-(`ansible_user`; `ump` on servers installed by ump). A change to their
-keys, home, shell or sudo could lock Ansible out. ump has given its
-administrator keys and sudo (`/etc/sudoers.d/90-ump-ump`).
+a user of `users_protected`: root, and the server's administrator
+(`ump_admin`, `ump` by default) when its host has one. ump has given
+the administrator keys and sudo (`/etc/sudoers.d/90-ump-NAME`) and its
+own runs log in as them: a change to their keys, home, shell or sudo
+could lock ump out. The user a person logs in as (`-u`, or the local
+user name) is not protected: their own entry manages them.
 - `~/.ssh` that is a symbolic link fails the run: the role runs as root
   and would hand the link's target to the user.
 - Entries with a `password` are not printed, also with `-v`.

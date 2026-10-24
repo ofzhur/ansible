@@ -9,5 +9,6 @@ users_groups: []
 users_shell: /bin/bash
 
 # Users that no entry may remove, give keys or take sudo from: root and
-# the user Ansible connects as.
-users_protected: "{{ ['root'] + ([ansible_user] if ansible_user is defined else []) }}"
+# the server's administrator, ump_admin, whom ump's own runs log in as.
+# Not the user a person logs in as (-u): their own entry manages them.
+users_protected: "{{ ['root'] + ([ump_admin] if ump_admin is defined else []) }}"

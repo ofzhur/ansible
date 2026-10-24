@@ -1,7 +1,8 @@
 # Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de>
 # MIT License (see LICENSE)
 
-"""Tests of the ofzhur.ansible.host inventory plugin and config/push/ansible.cfg.
+"""Tests of the ofzhur.ansible.host inventory plugin (host files in a directory;
+test_host_storage.py has those in a storage) and config/push/ansible.cfg.
 
 They run the ansible CLI found on PATH against an infrastructure repository
 laid out in a temporary directory, the way the template expects it:
@@ -24,7 +25,7 @@ plugin: ofzhur.ansible.host
 groups: [role_web, role_base, account_main]
 vars:
   ansible_host: 203.0.113.10
-  ansible_user: ump
+  ump_admin: ump
   ump_roles: [web, base]
   ump_attributes: {owner: ops}
   template: "{{ 1 + 1 }}"
@@ -101,8 +102,10 @@ class HostFiles(unittest.TestCase):
     def assertFails(self, infra, *messages):
         r = infra.run('ansible-inventory', '--list')
         self.assertNotEqual(r.returncode, 0, r.stdout)
+        # ansible-core < 2.19 wraps messages at 80 columns
+        squeezed = ''.join(r.stderr.split())
         for m in messages:
-            self.assertIn(m, r.stderr)
+            self.assertIn(''.join(m.split()), squeezed, r.stderr)
 
     def test_hosts_groups_vars(self):
         i = self.infra({
@@ -110,7 +113,7 @@ class HostFiles(unittest.TestCase):
             'inventory/hosts/web-01.yml': WEB,
             'inventory/hosts/db-01.yaml': DB,
             'inventory/group_vars/role_web.yml': 'http_port: 8080\n',
-            'inventory/host_vars/web-01.yml': 'ansible_user: admin\n',
+            'inventory/host_vars/web-01.yml': 'ump_admin: admin\n',
         })
         inv = i.inventory()
         hostvars = inv['_meta']['hostvars']
@@ -124,7 +127,8 @@ class HostFiles(unittest.TestCase):
         self.assertEqual(web['ump_roles'], ['web', 'base'])
         self.assertEqual(web['ump_attributes'], {'owner': 'ops'})
         self.assertEqual(web['http_port'], 8080)
-        self.assertEqual(web['ansible_user'], 'admin', 'host_vars/ wins over the host file')
+        self.assertEqual(web['ump_admin'], 'admin', 'host_vars/ wins over the host file')
+        self.assertNotIn('ansible_user', web)
         self.assertEqual(inv.get('ungrouped', {}).get('hosts', []), [])
 
     def test_values_are_not_templated(self):
@@ -186,6 +190,12 @@ class HostFiles(unittest.TestCase):
         self.assertFails(i, 'host web-01 is already defined by')
         inv = self.infra({'inventory/groups.yml': groups, 'inventory/hosts/web-01.yml': WEB}).inventory()
         self.assertEqual(inv['monitoring']['hosts'], ['web-01'])
+
+    def test_one_server_two_hosts(self):
+        # the same ump_ref: a server under its old name and its new one
+        server = 'plugin: ofzhur.ansible.host\nvars: {ump_ref: fake/1}\n'
+        i = self.infra({'inventory/hosts/old-01.yml': server, 'inventory/hosts/web-01.yml': server})
+        self.assertFails(i, 'web-01.yml: host web-01 has ump_ref fake/1, as has host old-01 of', 'one server, two hosts')
 
     def test_invalid_host_name(self):
         i = self.infra({'inventory/hosts/web 01.yml': 'plugin: ofzhur.ansible.host\n'})
