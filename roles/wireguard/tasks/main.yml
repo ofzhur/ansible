@@ -20,7 +20,9 @@
          + (['wireguard_groups'] if wireguard_groups | default(none)
                                     != hostvars[inventory_hostname].wireguard_groups | default(none) else [])
          + (['wireguard_isolation'] if wireguard_isolation != hostvars[inventory_hostname].wireguard_isolation | default([]) else [])
-         + (['wireguard_ports'] if wireguard_ports != hostvars[inventory_hostname].wireguard_ports | default({}) else []) }}
+         + (['wireguard_ports'] if wireguard_ports != hostvars[inventory_hostname].wireguard_ports | default({}) else [])
+         + (['wireguard_tunnel'] if wireguard_tunnel | default(none)
+                                    != hostvars[inventory_hostname].wireguard_tunnel | default(none) else []) }}
 
 # The networks of every host of the inventory (not only of --limit), each with
 # the host's address, the network's listen port and the host's groups there
@@ -113,6 +115,122 @@
   ansible.builtin.set_fact:
     __wireguard: "{{ __wireguard_hosts[inventory_hostname].networks.values() | sort(attribute='name') }}"
 
+# The tunnel of every host of the inventory that has one, as every host
+# reads it: a gateway serves the hosts whose tunnel is valid; a host whose
+# tunnel is not fails its own run. A gateway is a peer of its client in
+# their network, and has no tunnel of its own.
+- name: Read the tunnels of the inventory
+  ansible.builtin.set_fact:
+    __wireguard_tunnels: >-
+      {%- set ns = namespace(tunnels={}) -%}
+      {%- for h in groups['all'] if hostvars[h].wireguard_tunnel is defined -%}
+      {%-   set t = hostvars[h].wireguard_tunnel -%}
+      {%-   set gw = t if t is string else t.host if t is mapping and t.host is defined and t.host is string else none -%}
+      {%-   set net = t.network if t is mapping and t.network is defined else none -%}
+      {%-   set mine = __wireguard_hosts[h].networks -%}
+      {%-   set e = namespace(errors=[], network=none) -%}
+      {%-   if gw is none or t is mapping and (t.keys() | difference(['host', 'network']) or net is not none and net is not string) -%}
+      {%-     set e.errors = ['it is no host name, nor a mapping {host: NAME, network: NAME}'] -%}
+      {%-   elif gw == h -%}
+      {%-     set e.errors = ['a host is no gateway of its own'] -%}
+      {%-   elif gw not in groups['all'] -%}
+      {%-     set e.errors = [gw ~ ' is no host of the inventory'] -%}
+      {%-   elif hostvars[gw].wireguard_tunnel is defined -%}
+      {%-     set e.errors = [gw ~ ' has a tunnel of its own; a gateway has none'] -%}
+      {%-   else -%}
+      {%-     set theirs = __wireguard_hosts[gw].networks -%}
+      {%-     set shared = mine.keys() | intersect(theirs.keys()) | sort -%}
+      {%-     if net is not none and net not in mine -%}
+      {%-       set e.errors = [h ~ ' is in no network ' ~ net] -%}
+      {%-     elif net is not none and net not in theirs -%}
+      {%-       set e.errors = [gw ~ ' is in no network ' ~ net] -%}
+      {%-     elif net is none and not shared -%}
+      {%-       set e.errors = [h ~ ' and ' ~ gw ~ ' share no network'] -%}
+      {%-     elif net is none and shared | length > 1 -%}
+      {%-       set e.errors = [h ~ ' and ' ~ gw ~ ' share the networks ' ~ shared | join(', ')
+                                ~ '; set {host: ' ~ gw ~ ', network: NAME}'] -%}
+      {%-     else -%}
+      {%-       set e.network = net if net is not none else shared[0] -%}
+      {%-       set g = [mine[e.network].groups, theirs[e.network].groups] -%}
+      {%-       if g[0] and g[1] and not g[0] | intersect(g[1]) -%}
+      {%-         set e.errors = [h ~ ' and ' ~ gw ~ ' are isolated in ' ~ e.network ~ ' (groups ' ~ g[0] | join(', ')
+                                  ~ '; ' ~ g[1] | join(', ') ~ '): no tunnel between them'] -%}
+      {%-       endif -%}
+      {%-     endif -%}
+      {%-   endif -%}
+      {%-   set ns.tunnels = ns.tunnels | combine({h: {'gateway': gw, 'network': e.network, 'errors': e.errors}}) -%}
+      {%- endfor -%}
+      {{ ns.tunnels }}
+
+# The settings of a tunnel, checked on every host: a wrong one fails the
+# run before any change, as a wrong network does.
+- name: Refuse an invalid tunnel
+  ansible.builtin.assert:
+    that: __wireguard_errors == []
+    fail_msg: "wireguard: {{ inventory_hostname }}: {{ __wireguard_errors | join('; ') }}"
+    quiet: true
+  vars:
+    __wireguard_errors: >-
+      {%- macro ipv4(s) -%}
+      {%-   if s is string and s is match('^[0-9]{1,3}([.][0-9]{1,3}){3}$') and s == s | trim
+              and s.split('.') | map('int') | max <= 255 -%}
+      {%-     set o = s.split('.') | map('int') | list -%}
+      {{-     ((o[0] * 256 + o[1]) * 256 + o[2]) * 256 + o[3] -}}
+      {%-   else -%}-1{%- endif -%}
+      {%- endmacro -%}
+      {%- set ns = namespace(errors=__wireguard_tunnels[inventory_hostname].errors | default([])
+                                    | map('regex_replace', '^', 'wireguard_tunnel: ') | list, bit=false) -%}
+      {%- for d in wireguard_tunnel_direct -%}
+      {%-   set c = d.split('/') if d is string else [] -%}
+      {%-   set prefix = c[1] | int if c | length == 2 and c[1] is match('^[0-9]{1,2}$') else 0 -%}
+      {%-   set net = ipv4(c[0]) | int if c | length == 2 else -1 -%}
+      {%-   if not (1 <= prefix <= 32 and net >= 0 and net % 2 ** (32 - prefix) == 0) -%}
+      {%-     set ns.errors = ns.errors + ['wireguard_tunnel_direct: ' ~ d ~ ' is no IPv4 network of /1 to /32'] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {%- for i in range(32) if 2 ** i == wireguard_tunnel_mark -%}
+      {%-   set ns.bit = true -%}
+      {%- endfor -%}
+      {%- if not ns.bit -%}
+      {%-   set ns.errors = ns.errors + ['wireguard_tunnel_mark: ' ~ wireguard_tunnel_mark ~ ' is no single bit'] -%}
+      {%- endif -%}
+      {%- if not 1 <= wireguard_tunnel_table <= 4294967295 or wireguard_tunnel_table in [253, 254, 255] -%}
+      {%-   set ns.errors = ns.errors + ['wireguard_tunnel_table: ' ~ wireguard_tunnel_table
+                                         ~ ' is no table of its own (1 to 4294967295 but 253, 254, 255)'] -%}
+      {%- endif -%}
+      {%- if not 1 <= wireguard_tunnel_priority <= 32762 -%}
+      {%-   set ns.errors = ns.errors + ['wireguard_tunnel_priority: ' ~ wireguard_tunnel_priority ~ ' is not 1 to 32762'] -%}
+      {%- endif -%}
+      {{ ns.errors }}
+
+# This host's part: the client of its gateway in the network of the two,
+# or the gateway of the clients in some of its networks. The direct
+# networks as the kernel writes them.
+- name: Select the tunnel of this host
+  ansible.builtin.set_fact:
+    __wireguard_client: >-
+      {%- set t = __wireguard_tunnels[inventory_hostname] | default(none) -%}
+      {%- if t is not none -%}
+      {%-   set ns = namespace(direct=[]) -%}
+      {%-   for d in ['169.254.0.0/16'] + wireguard_tunnel_direct -%}
+      {%-     set ns.direct = ns.direct + [d.split('/')[0].split('.') | map('int') | join('.') ~ '/' ~ d.split('/')[1] | int] -%}
+      {%-   endfor -%}
+      {%-   set n = __wireguard_hosts[inventory_hostname].networks[t.network] -%}
+      {{ {'gateway': t.gateway, 'name': n.name, 'iface': n.iface, 'address': n.address, 'direct': ns.direct | unique} }}
+      {%- endif -%}
+    __wireguard_served: >-
+      {%- set ns = namespace(served=[]) -%}
+      {%- for n in __wireguard -%}
+      {%-   set c = namespace(clients=[]) -%}
+      {%-   for h, t in __wireguard_tunnels | dictsort if t.gateway == inventory_hostname and t.network == n.name and not t.errors -%}
+      {%-     set c.clients = c.clients + [__wireguard_hosts[h].networks[n.name].address] -%}
+      {%-   endfor -%}
+      {%-   if c.clients -%}
+      {%-     set ns.served = ns.served + [{'name': n.name, 'iface': n.iface, 'address': n.address, 'clients': c.clients | sort}] -%}
+      {%-   endif -%}
+      {%- endfor -%}
+      {{ ns.served }}
+
 # Interfaces wg-NAME whose network the host is no longer in. The role owns
 # /etc/wireguard/wg-*.conf and wg-*.key; other names there are not touched.
 - name: Look for /etc/wireguard
@@ -169,6 +287,29 @@
   loop_control:
     loop_var: __wireguard_network
 
+# What is there of a tunnel (the script, a tunneled host's, the unit, the
+# drop-ins of the interfaces), whether systemd has yet to read a unit or
+# drop-in (a run cut short), what it works with (systemd-networkd), and the
+# uplinks, the interfaces of main's default routes: the script knows them
+# at boot, before the network.
+- name: Look at the tunnel
+  ansible.builtin.shell: |
+    test -e /etc/wireguard/tunnel.sh && echo tunnel
+    grep -qs '^client=wg-' /etc/wireguard/tunnel.sh && echo client
+    test -e /etc/systemd/system/ofzhur-wireguard-tunnel.service && echo unit
+    for f in /etc/systemd/system/wg-quick@wg-*.service.d/ofzhur-wireguard.conf; do
+      test -e "$f" && f=${f#*@} && echo "drop-in ${f%.service.d/*}"
+    done
+    systemctl show -p NeedDaemonReload --value ofzhur-wireguard-tunnel.service docker.service 'wg-quick@wg-*.service' \
+      2>/dev/null | grep -qx yes && echo daemon-reload
+    systemctl cat systemd-networkd.service >/dev/null 2>&1 && echo networkd
+    { ip -4 route show table main default; test ! -d /proc/sys/net/ipv6 || ip -6 route show table main default; } 2>/dev/null \
+      | sed -n 's/.* dev \([^ ]*\).*/uplink \1/p' | grep -v -e ' lo$' -e ' wg-' -e ' ofzhur-closed$' | sort -u
+    true
+  check_mode: false
+  changed_when: false
+  register: __wireguard_tunnel_probe
+
 - name: Package and keys
   when: __wireguard != []
   block:
@@ -178,6 +319,7 @@
         dpkg-query -W -f '${Status}' python3-apt 2>/dev/null | grep -q ' installed$' && echo python3-apt
         command -v pacman >/dev/null && echo pacman
         command -v wg >/dev/null && echo have wg
+        command -v nft >/dev/null && echo have nft
         true
       check_mode: false
       changed_when: false
@@ -201,6 +343,24 @@
       args:
         creates: /usr/bin/wg-quick
       when: "'pacman' in __wireguard_probe.stdout_lines"
+
+    # nft for a tunnel, whatever the backend of the firewall. The package
+    # alone: nftables.service stays as it is.
+    - name: Package nftables (Debian, Ubuntu)
+      ansible.builtin.apt:
+        name: nftables
+        install_recommends: false
+        update_cache: true
+      when: >-
+        (__wireguard_client is mapping or __wireguard_served != [])
+        and 'apt' in __wireguard_probe.stdout_lines and 'have nft' not in __wireguard_probe.stdout_lines
+        and ('python3-apt' in __wireguard_probe.stdout_lines or not ansible_check_mode)
+
+    - name: Package nftables (Arch Linux)
+      ansible.builtin.command: pacman -S --needed --noconfirm nftables
+      args:
+        creates: /usr/sbin/nft
+      when: (__wireguard_client is mapping or __wireguard_served != []) and 'pacman' in __wireguard_probe.stdout_lines
 
     - name: Directory /etc/wireguard
       ansible.builtin.file:
@@ -285,7 +445,8 @@
 # other hosts' come from the fact cache, else from this host's configuration.
 # Two hosts of a network are peers unless both have groups there and share
 # none. New connections over the network: to a host without groups from all
-# its peers, to a host with groups from the peers sharing one.
+# its peers, to a host with groups from the peers sharing one. The gateway
+# of a tunneled host takes every IPv4 address it sends to no other peer.
 - name: Select the peers
   ansible.builtin.set_fact:
     __wireguard_peers: >-
@@ -322,6 +483,8 @@
       {%-     else -%}
       {%-       set p.peers = p.peers + [{'name': h, 'key': key, 'address': theirs.address, 'ip': ip,
                                          'endpoint': ('[' ~ ip ~ ']' if ':' in ip else ip) ~ ':' ~ theirs.port,
+                                         'allowed': [theirs.address ~ '/32'] + (['0.0.0.0/0'] if __wireguard_client
+                                                      and __wireguard_client.name == mine.name and __wireguard_client.gateway == h else []),
                                          'accept': not mine.groups or mine.groups | intersect(theirs.groups) | length > 0}] -%}
       {%-     endif -%}
       {%-   endfor -%}
@@ -343,12 +506,93 @@
       {{ ns.notes }}
   when: __wireguard_notes != []
 
+# A host tunneled no longer: its traffic goes directly before its
+# interfaces lose the mark, so that WireGuard's own packets never take the
+# tunnel's table. The script of this run, from stdin; check mode tells what
+# would change.
+- name: Tunnel of a host tunneled no longer
+  ansible.builtin.shell:
+    cmd: sh -s {{ 'check' if ansible_check_mode else 'up' }}
+    stdin: "{{ lookup('ansible.builtin.template', 'tunnel.sh.j2') }}"
+  register: __wireguard_down
+  changed_when: "'changed' in __wireguard_down.stdout_lines"
+  check_mode: false
+  when: __wireguard_client is not mapping and 'client' in __wireguard_tunnel_probe.stdout_lines
+
+# Before an interface starts, whose unit runs it.
+- name: Script of the tunnel
+  ansible.builtin.template:
+    src: tunnel.sh.j2
+    dest: /etc/wireguard/tunnel.sh
+    owner: root
+    group: root
+    mode: "0700"
+  when: __wireguard_client is mapping or __wireguard_served != []
+
+# The unit of an interface of the tunnel (a client's, those a gateway
+# serves) runs the script before the interface comes up, for the MTU, and
+# once it is, for its route and forwarding: systemd, not wg-quick (PostUp),
+# whose AppArmor profile (Ubuntu) runs no shell. A failed script leaves the
+# interface up. In place, and systemd reloaded, before an interface starts.
+- name: Units of the interfaces of the tunnel
+  vars:
+    __wireguard_dropins: >-
+      {{ ([__wireguard_client.iface] if __wireguard_client is mapping else [])
+         + __wireguard_served | map(attribute='iface') | list }}
+  block:
+    - name: Directories of the drop-ins of the interfaces
+      ansible.builtin.file:
+        path: /etc/systemd/system/wg-quick@{{ item }}.service.d
+        state: directory
+        owner: root
+        group: root
+        mode: "0755"
+      loop: "{{ __wireguard_dropins }}"
+
+    - name: Drop-ins of the interfaces
+      ansible.builtin.copy:
+        content: |
+          # Managed by Ansible: ofzhur.ansible.wireguard. Changes here are overwritten.
+          # The tunnel of this host: before the interface comes up (the MTU of
+          # ofzhur-closed, which wg-quick takes for it) and once it is (its route).
+          # Not wg-quick's PostUp: its AppArmor profile (Ubuntu) runs no shell.
+          [Service]
+          ExecStartPre=-/bin/sh /etc/wireguard/tunnel.sh up
+          ExecStartPost=-/bin/sh /etc/wireguard/tunnel.sh up
+        dest: /etc/systemd/system/wg-quick@{{ item }}.service.d/ofzhur-wireguard.conf
+        owner: root
+        group: root
+        mode: "0644"
+      loop: "{{ __wireguard_dropins }}"
+      register: __wireguard_dropin
+
+    # Their directories too, when empty.
+    - name: Remove the drop-ins of other interfaces
+      ansible.builtin.shell: |
+        {{ 'exit 0' if ansible_check_mode else '' }}
+        d=/etc/systemd/system/wg-quick@{{ item | quote }}.service.d
+        rm -f "$d/ofzhur-wireguard.conf"
+        rmdir --ignore-fail-on-non-empty "$d"
+      loop: >-
+        {{ __wireguard_tunnel_probe.stdout_lines | select('match', 'drop-in ') | map('regex_replace', '^drop-in ', '')
+           | reject('in', __wireguard_dropins) | list }}
+      register: __wireguard_dropin_removed
+      check_mode: false
+
+    - name: Reload systemd for the drop-ins
+      ansible.builtin.systemd_service:
+        daemon_reload: true
+      when: >-
+        __wireguard_dropin is changed or __wireguard_dropin_removed is changed
+        or 'daemon-reload' in __wireguard_tunnel_probe.stdout_lines
+
 # The configuration is put together on the host, which adds the private key
 # from its file: a standard wg-quick configuration that never passes through
 # Ansible. Replaced only when it differs. Table = off: wg-quick adds no
 # routes, policy rules or marks, whatever AllowedIPs holds; the one route is
 # the kernel's, to the address's network. Software that routes over the
-# interface owns its routes.
+# interface owns its routes; the tunnel's are tunnel.sh's, and the mark
+# (FwMark) sends WireGuard's own packets of a tunneled host directly.
 - name: Configurations
   ansible.builtin.shell:
     cmd: |
@@ -369,13 +613,16 @@
       Address = {{ item.address }}/{{ item.prefix }}
       ListenPort = {{ item.port }}
       Table = off
+      {% if __wireguard_client %}
+      FwMark = {{ '0x%x' % wireguard_tunnel_mark }}
+      {% endif %}
       {% for p in __wireguard_peers[item.name].peers %}
 
       # {{ p.name | regex_replace('[^A-Za-z0-9._-]', '_') }}
       [Peer]
       PublicKey = {{ p.key }}
       Endpoint = {{ p.endpoint }}
-      AllowedIPs = {{ p.address }}/32
+      AllowedIPs = {{ p.allowed | join(', ') }}
       PersistentKeepalive = 25
       {% endfor %}
     stdin_add_newline: false
@@ -429,10 +676,10 @@
 
 # Other changes: wg syncconf with the stripped configuration, as the unit's
 # reload, with no interruption. When the configuration changed, or the
-# interface differs from it in its port, key, peers or their AllowedIPs (a
-# change by hand, a run cut short); not in the endpoints, which follow a
-# peer that roams. Stripped first: a failed strip, an empty configuration,
-# would take every peer.
+# interface differs from it in its port, key, mark, peers or their
+# AllowedIPs (a change by hand, a run cut short), in any order; not in the
+# endpoints, which follow a peer that roams. Stripped first: a failed
+# strip, an empty configuration, would take every peer.
 - name: Peers of the running interfaces
   ansible.builtin.shell: |
     set -e
@@ -441,7 +688,8 @@
     {% if not __wireguard_conf.results[i].changed | default(false) %}
     s() {
       awk -F ' = ' '/^\[/{p=$0} $1=="PublicKey"{p=$2}
-        $1~/^(ListenPort|PrivateKey|PublicKey|AllowedIPs|PersistentKeepalive)$/{print p, $1, $2}' | sort
+        $1~/^(ListenPort|FwMark|PrivateKey|PublicKey|PersistentKeepalive)$/{print p, $1, $2}
+        $1=="AllowedIPs"{n=split($2, a, /, */); for (j=1; j<=n; j++) print p, $1, a[j]}' | sort
     }
     [ "$(printf '%s\n' "$c" | s)" != "$(wg showconf "$f" | s)" ] || exit 0
     {% endif %}
@@ -471,6 +719,115 @@
     label: "{{ item.iface }}"
     index_var: i
   when: item.name in wireguard_public_keys
+
+# Once the interfaces are as configured: the new state in place before the
+# old goes, nothing restarted; a gateway's that serves no clients any more
+# goes. Check mode tells what would change.
+- name: Tunnel
+  ansible.builtin.shell:
+    cmd: sh -s {{ 'check' if ansible_check_mode else 'up' }}
+    stdin: "{{ lookup('ansible.builtin.template', 'tunnel.sh.j2') }}"
+  register: __wireguard_up
+  changed_when: "'changed' in __wireguard_up.stdout_lines"
+  check_mode: false
+  when: __wireguard_client is mapping or __wireguard_served != [] or 'tunnel' in __wireguard_tunnel_probe.stdout_lines
+
+- name: Unit of the tunnel
+  ansible.builtin.template:
+    src: ofzhur-wireguard-tunnel.service.j2
+    dest: /etc/systemd/system/ofzhur-wireguard-tunnel.service
+    owner: root
+    group: root
+    mode: "0644"
+  register: __wireguard_unit
+  when: __wireguard_client is mapping or __wireguard_served != []
+
+# Docker drops what it does not forward itself (the policy of FORWARD);
+# once it is up, tunnel.sh lets a gateway's clients through DOCKER-USER.
+# On every gateway, Docker or not: in place for Docker's first start too.
+- name: Directory of the drop-in of docker.service
+  ansible.builtin.file:
+    path: /etc/systemd/system/docker.service.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: __wireguard_served != []
+
+- name: Drop-in of docker.service
+  ansible.builtin.copy:
+    content: |
+      # Managed by Ansible: ofzhur.ansible.wireguard. Changes here are overwritten.
+      # The clients of the gateway through DOCKER-USER, once Docker is up.
+      [Service]
+      ExecStartPost=-/bin/sh /etc/wireguard/tunnel.sh up
+    dest: /etc/systemd/system/docker.service.d/ofzhur-wireguard.conf
+    owner: root
+    group: root
+    mode: "0644"
+  register: __wireguard_docker
+  when: __wireguard_served != []
+
+# systemd-networkd removes the routing rules of others when it starts (an
+# upgrade, a reboot); a tunneled host keeps its own. Read at its next start.
+- name: Directory /etc/systemd/networkd.conf.d
+  ansible.builtin.file:
+    path: /etc/systemd/networkd.conf.d
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: __wireguard_client is mapping and 'networkd' in __wireguard_tunnel_probe.stdout_lines
+
+- name: Drop-in of systemd-networkd
+  ansible.builtin.copy:
+    content: |
+      # Managed by Ansible: ofzhur.ansible.wireguard. Changes here are overwritten.
+      # The routing rules of the tunnel stay when systemd-networkd starts.
+      [Network]
+      ManageForeignRoutingPolicyRules=no
+    dest: /etc/systemd/networkd.conf.d/ofzhur-wireguard.conf
+    owner: root
+    group: root
+    mode: "0644"
+  when: __wireguard_client is mapping and 'networkd' in __wireguard_tunnel_probe.stdout_lines
+
+# A unit new in check mode is not there yet.
+- name: Tunnel at boot
+  ansible.builtin.systemd_service:
+    name: ofzhur-wireguard-tunnel
+    daemon_reload: "{{ __wireguard_unit is changed or __wireguard_docker is changed }}"
+    enabled: true
+    state: started
+  when: >-
+    (__wireguard_client is mapping or __wireguard_served != [])
+    and not (ansible_check_mode and 'unit' not in __wireguard_tunnel_probe.stdout_lines)
+
+# No tunnel any more: what tunnel.sh put in place has gone with its run above.
+- name: Stop the tunnel at boot
+  ansible.builtin.systemd_service:
+    name: ofzhur-wireguard-tunnel
+    enabled: false
+    state: stopped
+  when: not (__wireguard_client is mapping or __wireguard_served != []) and 'unit' in __wireguard_tunnel_probe.stdout_lines
+
+- name: Remove the files of the tunnel
+  ansible.builtin.file:
+    path: "{{ item }}"
+    state: absent
+  loop: >-
+    {{ ([] if __wireguard_client is mapping or __wireguard_served
+           else ['/etc/wireguard/tunnel.sh', '/etc/systemd/system/ofzhur-wireguard-tunnel.service'])
+       + ([] if __wireguard_served else ['/etc/systemd/system/docker.service.d/ofzhur-wireguard.conf'])
+       + ([] if __wireguard_client is mapping else ['/etc/systemd/networkd.conf.d/ofzhur-wireguard.conf']) }}
+  register: __wireguard_tunnel_removed
+
+- name: Reload systemd
+  ansible.builtin.systemd_service:
+    daemon_reload: true
+  when: >-
+    __wireguard_tunnel_removed.results | selectattr('changed')
+    | map(attribute='item') | select('search', '[.]service') | list != []
 
 # The port, open to the peers, and the policy of the interface: new
 # connections from the peers this host lets in. No peer, or no firewall

@@ -3,18 +3,22 @@
 
 """Tests of the role ofzhur.ansible.wireguard.
 
-The checks run the ansible CLI found on PATH only. The scenario also runs
-Docker: six containers with systemd on one Docker network (a, c and e on
-Debian 13, b, d and f on Ubuntu 24.04), each reached over SSH as the user
-ump through `docker exec` and nc, so that ansible_host is the container's
-address on the network, the endpoint its peers reach, as a server's public
-address is. Without Docker it is skipped.
+The checks run the ansible CLI found on PATH only. The scenarios also run
+Docker. The mesh: six containers with systemd on one Docker network (a, c
+and e on Debian 13, b, d and f on Ubuntu 24.04), each reached over SSH as
+the user ump through `docker exec` and nc, so that ansible_host is the
+container's address on the network, the endpoint its peers reach, as a
+server's public address is. The tunnel: a gateway (Debian 13) and two
+hosts tunneled through it (Ubuntu 24.04, Debian 13), with a public /32
+each, routed by a fourth container, the internet, which holds addresses
+elsewhere that tell the source they see, and through which SSH comes to
+the public addresses. Without Docker they are skipped.
 
     python3 tests/test_wireguard.py
 
-With the role ofzhur.ansible.firewall in the collection the scenario runs it
-too and checks the ports it opens and the connections it lets in; without,
-wireguard_firewall is false and the peers connect both ways.
+With the role ofzhur.ansible.firewall in the collection the scenarios run
+it too and check the ports it opens and the connections it lets in;
+without, wireguard_firewall is false and the peers connect both ways.
 """
 
 import json
@@ -62,6 +66,24 @@ vars:
     lab: {address: 10.0.1.1, cidr: 10.0.1.0/24}
 """
 
+# Hosts outside the play, gateways for the checks of a tunnel: gw in both
+# networks of web-01, gw2 in default, gw3 in another one, gw4 tunneled.
+OTHER = """\
+plugin: ofzhur.ansible.host
+groups: [other]
+vars:
+  ansible_host: {address}
+  ump_private_networks: {networks}
+"""
+GATEWAYS = {
+    'inventory/hosts/gw.yml': OTHER.format(address='192.0.2.2', networks='{default: {address: 10.0.0.2, cidr: 10.0.0.0/24},'
+                                                                         ' lab: {address: 10.0.1.2, cidr: 10.0.1.0/24}}'),
+    'inventory/hosts/gw2.yml': OTHER.format(address='192.0.2.3', networks='{default: {address: 10.0.0.3, cidr: 10.0.0.0/24}}'),
+    'inventory/hosts/gw3.yml': OTHER.format(address='192.0.2.4', networks='{far: {address: 10.9.9.4, cidr: 10.9.9.0/24}}'),
+    'inventory/hosts/gw4.yml': OTHER.format(address='192.0.2.5', networks='{default: {address: 10.0.0.5, cidr: 10.0.0.0/24}}'),
+    'inventory/host_vars/gw4.yml': 'wireguard_tunnel: gw2\n',
+}
+
 
 class Checks(unittest.TestCase):
     """The playbook resolves; a bad variable or network fails before the first change."""
@@ -95,6 +117,7 @@ class Checks(unittest.TestCase):
         r = self.infra({}).run('ansible-doc', '-t', 'role', 'ofzhur.ansible.wireguard')
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn('wireguard_groups', r.stdout)
+        self.assertIn('wireguard_tunnel_direct', r.stdout)
 
     def test_valid(self):
         # every check passes; the first module fails, with no interpreter on this host
@@ -102,7 +125,15 @@ class Checks(unittest.TestCase):
                            'inventory/group_vars/all.yml': 'wireguard_isolation: [common]\n'})
         self.assertNotEqual(r.returncode, 0, r.stdout)
         self.assertIn('TASK [ofzhur.ansible.wireguard : Look for /etc/wireguard]', r.stdout)
-        self.assertEqual(recap(r.stdout)['web-01']['ok'], 5)
+        self.assertEqual(recap(r.stdout)['web-01']['ok'], 8)
+        # with a tunnel, its gateway named either way
+        for tunnel in ('gw2', '{host: gw, network: lab}'):
+            with self.subTest(tunnel):
+                r = self.run_role({**GATEWAYS, 'inventory/host_vars/web-01.yml':
+                                   f'wireguard_tunnel: {tunnel}\nwireguard_tunnel_direct: [192.0.2.0/24, 198.51.100.7/32]\n'
+                                   'wireguard_tunnel_mark: 0x80000000\nwireguard_tunnel_table: 100\nwireguard_tunnel_priority: 1\n'})
+                self.assertIn('TASK [ofzhur.ansible.wireguard : Look for /etc/wireguard]', r.stdout)
+                self.assertEqual(recap(r.stdout)['web-01']['ok'], 8)
 
     def test_wrong_type(self):
         cases = {
@@ -110,6 +141,9 @@ class Checks(unittest.TestCase):
             'ports': 'wireguard_ports: [51820]\n',
             'firewall': 'wireguard_firewall: maybe\n',
             'isolation': 'wireguard_isolation: {foo: 1}\n',
+            'tunnel_direct': 'wireguard_tunnel_direct: {a: 1}\n',
+            'tunnel_mark': 'wireguard_tunnel_mark: many\n',
+            'tunnel_table': 'wireguard_tunnel_table: [1]\n',
         }
         for name, host_vars in cases.items():
             with self.subTest(name):
@@ -141,6 +175,38 @@ class Checks(unittest.TestCase):
             with self.subTest(name):
                 self.assertRefused({'inventory/host_vars/web-01.yml': host_vars}, message, ok=3)
 
+    def test_invalid_tunnel(self):
+        cases = {
+            'unknown': ('wireguard_tunnel: nohost\n', 'wireguard_tunnel: nohost is no host of the inventory'),
+            'self': ('wireguard_tunnel: web-01\n', 'wireguard_tunnel: a host is no gateway of its own'),
+            'list': ('wireguard_tunnel: [gw2]\n', 'wireguard_tunnel: it is no host name, nor a mapping {host: NAME, network: NAME}'),
+            'key': ('wireguard_tunnel: {host: gw2, net: default}\n', 'wireguard_tunnel: it is no host name, nor a mapping'),
+            'two networks': ('wireguard_tunnel: gw\n',
+                             'wireguard_tunnel: web-01 and gw share the networks default, lab; set {host: gw, network: NAME}'),
+            'not the gateway\'s': ('wireguard_tunnel: {host: gw2, network: lab}\n', 'wireguard_tunnel: gw2 is in no network lab'),
+            'not the host\'s': ('wireguard_tunnel: {host: gw3, network: far}\n', 'wireguard_tunnel: web-01 is in no network far'),
+            'none shared': ('wireguard_tunnel: gw3\n', 'wireguard_tunnel: web-01 and gw3 share no network'),
+            'chain': ('wireguard_tunnel: gw4\n', 'wireguard_tunnel: gw4 has a tunnel of its own; a gateway has none'),
+            'direct host': ('wireguard_tunnel_direct: [10.0.0.1/8]\n',
+                            'wireguard_tunnel_direct: 10.0.0.1/8 is no IPv4 network of /1 to /32'),
+            'direct all': ('wireguard_tunnel_direct: [0.0.0.0/0]\n', 'wireguard_tunnel_direct: 0.0.0.0/0 is no IPv4 network'),
+            'direct IPv6': ('wireguard_tunnel_direct: [fd00::/8]\n', 'wireguard_tunnel_direct: fd00::/8 is no IPv4 network'),
+            'direct address': ('wireguard_tunnel_direct: [192.0.2.1]\n', 'wireguard_tunnel_direct: 192.0.2.1 is no IPv4 network'),
+            'mark': ('wireguard_tunnel_mark: 3\n', 'wireguard_tunnel_mark: 3 is no single bit'),
+            'no mark': ('wireguard_tunnel_mark: 0\n', 'wireguard_tunnel_mark: 0 is no single bit'),
+            'table main': ('wireguard_tunnel_table: 254\n', 'wireguard_tunnel_table: 254 is no table of its own'),
+            'table 0': ('wireguard_tunnel_table: 0\n', 'wireguard_tunnel_table: 0 is no table of its own'),
+            'priority': ('wireguard_tunnel_priority: 32763\n', 'wireguard_tunnel_priority: 32763 is not 1 to 32762'),
+        }
+        for name, (host_vars, message) in cases.items():
+            with self.subTest(name):
+                self.assertRefused({**GATEWAYS, 'inventory/host_vars/web-01.yml': host_vars}, message, ok=6)
+        # a gateway isolated from the host, its groups sharing none of the host's
+        self.assertRefused({**GATEWAYS, 'inventory/host_vars/web-01.yml': 'wireguard_tunnel: gw2\nwireguard_groups: [foo]\n',
+                            'inventory/host_vars/gw2.yml': 'wireguard_groups: [bar]\n'},
+                           'wireguard_tunnel: web-01 and gw2 are isolated in default (groups foo; bar): no tunnel between them',
+                           ok=6)
+
     def test_outside_the_inventory(self):
         # the other hosts would not see a role parameter or a play variable
         playbooks = {
@@ -148,10 +214,11 @@ class Checks(unittest.TestCase):
                                           '- role: ofzhur.ansible.wireguard\n      wireguard_groups: [db]'),
             'play': PLAYBOOK.replace('  roles:', '  vars:\n    wireguard_ports: {default: 51820}\n  roles:'),
             'isolation': PLAYBOOK.replace('  roles:', '  vars:\n    wireguard_isolation: [common]\n  roles:'),
+            'tunnel': PLAYBOOK.replace('  roles:', '  vars:\n    wireguard_tunnel: gw2\n  roles:'),
         }
         for name, playbook in playbooks.items():
             with self.subTest(name):
-                r = self.run_role({'playbooks/wireguard.yml': playbook})
+                r = self.run_role({**GATEWAYS, 'playbooks/wireguard.yml': playbook})
                 self.assertNotEqual(r.returncode, 0, r.stdout)
                 self.assertIn('of web-01 set outside the inventory; set it in group_vars or host_vars', r.stdout)
         # extra variables: every host sees them
@@ -725,6 +792,921 @@ class Mesh(unittest.TestCase):
         self.assertReaches('c', '10.0.1.6')
         self.assertReaches('d', '10.0.0.3')
         self.assertUnchanged(self.play())
+
+
+# --- Docker: a tunnel ---------------------------------------------------------
+
+# test_wireguard's image with the packages of a tunnel (and iptables, for
+# Docker's chain, conntrack, to flush it), and the user of systemd-resolved:
+# the servers here have no way out to install them.
+DOCKERFILE_TUNNEL = """\
+FROM {image}
+RUN apt-get update \\
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \\
+      wireguard-tools nftables iptables conntrack \\
+ && rm -rf /var/lib/apt/lists/* \\
+ && {{ id systemd-resolve >/dev/null 2>&1 || useradd -r -M -s /usr/sbin/nologin systemd-resolve; }}
+"""
+
+# The gateway g, c and x tunneled through it (c in foo, x in bar: isolated
+# from each other, not from g; g and x in lab too), and i, the internet: the
+# router of their public addresses, each a /32 as with some providers, and
+# the holder of addresses elsewhere, which tell the source they see.
+TUNNEL_HOSTS = {'g': 'debian', 'c': 'ubuntu', 'x': 'debian'}
+SUBNET, SUBNET6 = '10.231.0.0/24', 'fd7a:231::/64'
+PUBLIC = {'g': '10.231.0.11', 'c': '10.231.0.12', 'x': '10.231.0.13', 'i': '10.231.0.100'}
+PUBLIC6 = {'g': 'fd7a:231::11', 'c': 'fd7a:231::12', 'x': 'fd7a:231::13', 'i': 'fd7a:231::100'}
+MESH = {'g': '10.0.0.1', 'c': '10.0.0.2', 'x': '10.0.0.3'}
+LAB = {'g': '10.0.1.1', 'x': '10.0.1.3'}
+GROUPS = {'g': [], 'c': ['foo'], 'x': ['bar']}
+INTERNET, INTERNET6 = '203.0.113.1', 'fd7a:232::1'
+DIRECT = '192.0.2.5'
+METADATA = '169.254.169.254'
+# The provider's MTU, which its network sets at boot, after Docker's 1500: a
+# WireGuard interface gets 80 less.
+MTU = 1450
+
+# ump's runs come from the internet to the public address, as they do to a server.
+TUNNEL_HOST = """\
+plugin: ofzhur.ansible.host
+groups: {groups}
+vars:
+  ansible_host: {address}
+  ump_admin: ump
+  ump_private_networks: {networks}
+  ansible_ssh_private_key_file: {dir}/ump
+  ansible_ssh_common_args: >-
+    -o UserKnownHostsFile={dir}/known_hosts -o IdentitiesOnly=yes
+    -o ProxyCommand="{docker} exec -i {internet} nc -s {source} {address} 22"
+"""
+
+TUNNELS = {
+    'c': f'wireguard_tunnel: g\nwireguard_tunnel_direct: [{DIRECT}/32]\n',
+    'x': 'wireguard_tunnel: {host: g, network: default}\n',
+}
+
+# The provider's network of a server, at every boot after network-pre.target
+# and before network.target, as a network manager brings it up: its MTU, the
+# public address a /32, the internet behind i, IPv4 and IPv6, and behind that
+# an IPv6 default unreachable (dev lo, no uplink); on g, a private network
+# too, lan0, without a default route.
+NETWORK = """\
+#!/bin/sh
+ip link set eth0 mtu {mtu}
+ip address replace {address}/32 dev eth0
+ip address del {address}/24 dev eth0 2>/dev/null
+ip route replace {router} dev eth0 scope link
+ip route replace default via {router} dev eth0
+ip -6 route replace default via {router6} dev eth0
+ip -6 route replace unreachable default metric 4000000
+{lan}true
+"""
+LAN0 = """\
+ip link add lan0 type dummy 2>/dev/null
+ip address replace 10.97.0.1/24 dev lan0
+ip link set lan0 up
+"""
+NETWORK_UNIT = """\
+[Unit]
+Description=The provider's network
+DefaultDependencies=no
+After=network-pre.target
+Before=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /usr/local/sbin/test-network
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+# A TCP server that answers, and writes down, the source address it sees.
+WHOAMI = """\
+import socket, socketserver, sys
+class Handler(socketserver.BaseRequestHandler):
+    def handle(self):
+        with open('/tmp/seen', 'a') as f:
+            f.write(self.client_address[0] + '\\n')
+        self.request.sendall((self.client_address[0] + '\\n').encode())
+class Server(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+    address_family = socket.AF_INET6 if ':' in sys.argv[1] else socket.AF_INET
+Server((sys.argv[1], int(sys.argv[2])), Handler).serve_forever()
+"""
+
+# A resolver, as far as the tunnel is concerned: it answers the source address it sees.
+RESOLVER = """\
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind((sys.argv[1], int(sys.argv[2])))
+while True:
+    data, address = s.recvfrom(512)
+    s.sendto((address[0] + '\\n').encode(), address)
+"""
+
+# A question to it, as systemd-resolved asks the resolvers of a link: from a
+# socket bound to the link (IP_UNICAST_IF, the index in network byte order).
+ASK = """\
+import socket, sys
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if len(sys.argv) > 3:
+    s.setsockopt(socket.IPPROTO_IP, 50, socket.if_nametoindex(sys.argv[3]).to_bytes(4, 'big'))
+s.settimeout(3)
+try:
+    s.sendto(b'?', (sys.argv[1], int(sys.argv[2])))
+    print(s.recv(64).decode().strip())
+except OSError:
+    pass
+"""
+
+# Docker's way on c: a container's network namespace, port 8080 of c's
+# address DNAT to it, and its own connections masqueraded.
+APP = """\
+ip netns add app
+ip link add vapp type veth peer name veth0 netns app
+ip address add 10.99.0.1/24 dev vapp
+ip link set vapp up
+ip -n app address add 10.99.0.2/24 dev veth0
+ip -n app link set veth0 up
+ip -n app link set lo up
+ip -n app route add default via 10.99.0.1
+nft -f - <<EOF
+table ip app {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		ip daddr {address} tcp dport 8080 dnat to 10.99.0.2:80
+	}
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		ip saddr 10.99.0.0/24 oifname != "vapp" masquerade
+	}
+}
+EOF
+"""
+
+# c's networks beside the internet: lan, a host behind another interface
+# (a route of main but its default), and a bridge with two containers on
+# it, which br_netfilter shows to the IPv4 and IPv6 hooks.
+LOCAL_NETWORKS = """\
+ip netns add lan
+ip link add vlan type veth peer name eth0 netns lan
+ip address add 10.98.0.1/24 dev vlan
+ip link set vlan up
+ip -n lan address add 10.98.0.2/24 dev eth0
+ip -n lan link set eth0 up
+ip -n lan link set lo up
+ip -n lan route add default via 10.98.0.1
+ip link add br-test type bridge
+ip link set br-test up
+for n in 2 3; do
+  ip netns add b$n
+  ip link add vb$n type veth peer name eth0 netns b$n
+  ip link set vb$n master br-test up
+  ip -n b$n address add 10.88.0.$n/24 dev eth0
+  ip -n b$n address add fd88::$n/64 dev eth0 nodad
+  ip -n b$n link set eth0 up
+  ip -n b$n link set lo up
+done
+echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
+"""
+LOCAL_NETWORKS_GONE = """\
+for n in lan b2 b3; do ip netns pids $n | xargs -r kill; ip netns del $n; done
+ip link del br-test
+"""
+
+# A port of c's container published on an address that came after the run.
+PUBLISHED = """\
+ip address add 10.231.0.22/32 dev eth0
+nft -f - <<EOF
+table ip app2 {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		ip daddr 10.231.0.22 tcp dport 8080 dnat to 10.99.0.2:80
+	}
+}
+EOF
+"""
+
+# Docker on g, as it sets itself up: FORWARD drops what it does not let
+# through, DOCKER-USER first (with a rule of the owner's), its bridge
+# docker0 with a container, nothing published, its connections out
+# masqueraded.
+DOCKER = """\
+ip netns add ctr
+ip link add docker0 type bridge
+ip address add 172.18.0.1/24 dev docker0
+ip link set docker0 up
+echo 1 > /proc/sys/net/ipv4/conf/docker0/forwarding
+ip link add vctr type veth peer name eth0 netns ctr
+ip link set vctr master docker0 up
+ip -n ctr address add 172.18.0.2/24 dev eth0
+ip -n ctr link set eth0 up
+ip -n ctr link set lo up
+ip -n ctr route add default via 172.18.0.1
+iptables -w -P FORWARD DROP
+iptables -w -N DOCKER-USER
+iptables -w -A DOCKER-USER -s 192.0.2.99/32 -j DROP
+iptables -w -A DOCKER-USER -j RETURN
+iptables -w -A FORWARD -j DOCKER-USER
+iptables -w -A FORWARD -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -w -A FORWARD -i docker0 ! -o docker0 -j ACCEPT
+iptables -w -t nat -A POSTROUTING -s 172.18.0.0/24 ! -o docker0 -j MASQUERADE
+"""
+OWNER = '-A DOCKER-USER -s 192.0.2.99/32 -j DROP'
+
+# Packets in through the tunnel from others than the gateway, by source:
+# from the internet, and from the other client, sent through the gateway.
+COUNTER = """\
+table inet ofzhur-test
+delete table inet ofzhur-test
+table inet ofzhur-test {{
+	chain prerouting {{
+		type filter hook prerouting priority -400; policy accept;
+		iifname "wg-default" ip saddr {internet} counter comment "internet"
+		iifname "wg-default" ip saddr {mesh} counter comment "mesh"
+	}}
+}}
+"""
+
+
+class Tunnel(unittest.TestCase):
+    """A gateway and two hosts tunneled through it, on the internet; the role run on them as ump runs it, step by step."""
+
+    maxDiff = None
+
+    @classmethod
+    def setUpClass(cls):
+        if not have_docker():
+            raise unittest.SkipTest('Docker is not available')
+        for os_, base in BASES.items():
+            docker('build', '-q', '-t', f'ofzhur-test-wireguard:{os_}', '-', input=DOCKERFILE.format(base=base))
+            docker('build', '-q', '-t', f'ofzhur-test-tunnel:{os_}', '-',
+                   input=DOCKERFILE_TUNNEL.format(image=f'ofzhur-test-wireguard:{os_}'))
+
+        cls.net = 'ofzhur-test-tunnel'
+        cls.names = {h: f'ofzhur-test-tunnel-{h}' for h in [*TUNNEL_HOSTS, 'i']}
+        for name in cls.names.values():
+            docker('rm', '-f', name, check=False)
+        docker('network', 'rm', cls.net, check=False)
+        docker('network', 'create', '--ipv6', '--subnet', SUBNET, '--subnet', SUBNET6, cls.net)
+        cls.addClassCleanup(docker, 'network', 'rm', cls.net, check=False)
+
+        cls.infra = Infra({'playbooks/wireguard.yml': PLAYBOOK_FIREWALL if FIREWALL else PLAYBOOK,
+                           'inventory/group_vars/all.yml': ISOLATION + ('' if FIREWALL else 'wireguard_firewall: false\n')})
+        cls.addClassCleanup(cls.infra.close)
+        d = cls.infra.dir
+        subprocess.run(['ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', 'ump@test', '-f', f'{d}/ump'], check=True)
+        with open(f'{d}/ump.pub') as f:
+            key = f.read().strip()
+
+        # the internet: it forwards between the servers, never redirecting them to each other
+        i = cls.names['i']
+        cls.addClassCleanup(docker, 'rm', '-f', i, check=False)
+        docker('run', '-d', '--name', i, '--hostname', 'i', '--network', cls.net, '--ip', PUBLIC['i'], '--ip6', PUBLIC6['i'],
+               '--privileged', '--sysctl', 'net.ipv6.conf.all.disable_ipv6=0', '--sysctl', 'net.ipv4.ip_forward=1',
+               '--sysctl', 'net.ipv6.conf.all.forwarding=1', 'ofzhur-test-tunnel:debian', 'sleep', 'infinity')
+        docker('exec', '-i', i, 'sh', '-c', 'cat > /tmp/whoami.py', input=WHOAMI)
+        docker('exec', '-i', i, 'sh', '-c', 'cat > /tmp/resolver.py', input=RESOLVER)
+        docker('exec', i, 'sh', '-c',
+               f'for a in {INTERNET} {DIRECT} {METADATA}; do ip address add $a/32 dev lo; done'
+               f' && ip address add {INTERNET6}/128 dev lo'
+               f' && ip link set eth0 mtu {MTU}'
+               ' && for f in /proc/sys/net/ipv4/conf/*/send_redirects; do echo 0 > $f; done && touch /tmp/seen')
+        for address in (INTERNET, DIRECT, METADATA, PUBLIC6['i'], INTERNET6):
+            docker('exec', '-d', i, 'python3', '/tmp/whoami.py', address, '8080')
+        docker('exec', '-d', i, 'python3', '/tmp/resolver.py', INTERNET, '53')
+
+        for host, os_ in TUNNEL_HOSTS.items():
+            name = cls.names[host]
+            cls.addClassCleanup(docker, 'rm', '-f', name, check=False)
+            # g forwards nothing until the role has it forward; c forwards for its container, as Docker has it
+            docker('run', '-d', '--name', name, '--hostname', host, '--network', cls.net,
+                   '--ip', PUBLIC[host], '--ip6', PUBLIC6[host], '--privileged', '--tmpfs', '/run', '--tmpfs', '/run/lock',
+                   '--sysctl', 'net.ipv6.conf.all.disable_ipv6=0',
+                   '--sysctl', f'net.ipv4.ip_forward={0 if host == "g" else 1}', f'ofzhur-test-tunnel:{os_}')
+            docker('exec', '-i', name, 'sh', '-c',
+                   'install -d -m 700 -o ump -g ump /home/ump/.ssh'
+                   ' && cat > /home/ump/.ssh/authorized_keys'
+                   ' && chown ump:ump /home/ump/.ssh/authorized_keys'
+                   ' && chmod 600 /home/ump/.ssh/authorized_keys',
+                   input=key + '\n')
+            docker('exec', '-i', name, 'sh', '-c', 'cat > /usr/local/bin/whoami.py', input=WHOAMI)
+            docker('exec', '-i', name, 'sh', '-c', 'cat > /usr/local/bin/ask.py', input=ASK)
+            docker('exec', '-i', name, 'sh', '-c', 'cat > /usr/local/sbin/test-network',
+                   input=NETWORK.format(mtu=MTU, address=PUBLIC[host], router=PUBLIC['i'], router6=PUBLIC6['i'],
+                                        lan=LAN0 if host == 'g' else ''))
+            docker('exec', '-i', name, 'sh', '-c', 'cat > /etc/systemd/system/test-network.service'
+                   ' && ln -s /etc/systemd/system/test-network.service /etc/systemd/system/multi-user.target.wants/'
+                   ' && sh /usr/local/sbin/test-network', input=NETWORK_UNIT)
+            networks = {'default': (MESH[host], '10.0.0.0/24'), **({'lab': (LAB[host], '10.0.1.0/24')} if host in LAB else {})}
+            cls.infra.write(f'inventory/hosts/{host}.yml', TUNNEL_HOST.format(
+                groups=json.dumps(['common'] + GROUPS[host]), address=PUBLIC[host], dir=d,
+                networks='{' + ', '.join(f'{n}: {{address: {a}, cidr: {c}}}' for n, (a, c) in networks.items()) + '}',
+                docker=shutil.which('docker'), internet=i, source=INTERNET))
+        cls.boot()
+
+    @classmethod
+    def boot(cls):
+        """What Docker sets up anew at every start, c's container; then SSH to all."""
+        docker('exec', '-i', cls.names['c'], 'sh', '-c', APP.replace('{address}', PUBLIC['c']))
+        docker('exec', '-d', cls.names['c'], 'ip', 'netns', 'exec', 'app', 'python3', '/usr/local/bin/whoami.py', '0.0.0.0', '80')
+        for _ in range(60):
+            r = cls.infra.run('ansible', 'all', '-m', 'ansible.builtin.ping', *AS_UMP)
+            if r.returncode == 0:
+                break
+            time.sleep(1)
+        else:
+            raise AssertionError(f'the containers are not reachable over SSH:\n{r.stdout}{r.stderr}')
+
+    def tunnels(self, on=True):
+        for host, host_vars in TUNNELS.items():
+            path = os.path.join(self.infra.dir, 'inventory', 'host_vars', f'{host}.yml')
+            if on:
+                self.infra.write(f'inventory/host_vars/{host}.yml', host_vars)
+            elif os.path.exists(path):
+                os.remove(path)
+
+    def play(self, *args, hosts=TUNNEL_HOSTS):
+        r = self.infra.run('ansible-playbook', 'playbooks/wireguard.yml', *AS_UMP, *args)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(sorted(recap(r.stdout)), sorted(hosts))
+        return r
+
+    def assertUnchanged(self, r):
+        for host, counts in recap(r.stdout).items():
+            self.assertEqual(counts['changed'], 0, f'{host}\n{r.stdout}')
+
+    def sh(self, host, command):
+        return docker('exec', self.names[host], 'sh', '-c', command, check=False)
+
+    def out(self, host, command):
+        r = self.sh(host, command)
+        self.assertEqual(r.returncode, 0, f'{host}: {command}: {r.stderr}')
+        return r.stdout
+
+    def source(self, host, address=INTERNET, port=8080, netns=None):
+        """The source address that a new TCP connection from host shows at address, or '' when none gets there."""
+        command = f'nc -w 3 {address} {port} </dev/null'
+        return self.sh(host, f'ip netns exec {netns} {command}' if netns else command).stdout.strip()
+
+    def assertSource(self, host, expected, address=INTERNET, port=8080, netns=None):
+        for _ in range(10):
+            seen = self.source(host, address, port, netns)
+            if seen == expected:
+                break
+            time.sleep(1)
+        self.assertEqual(seen, expected, f'{host} to {address}')
+
+    def seen(self):
+        return self.out('i', 'cat /tmp/seen').split()
+
+    def assertClosed(self, host, netns=None):
+        """Nothing new from host gets to the internet, IPv4 or IPv6, on the link or beyond, from its own address least of all."""
+        before = len(self.seen())
+        for address in (INTERNET, PUBLIC6['i'], INTERNET6):
+            self.assertEqual(self.source(host, address, netns=netns), '', f'{host} to {address}')
+        self.assertEqual(self.seen()[before:], [])
+
+    def answers(self, host, port=22, family=4, source=None, address=None):
+        """What the first bytes from port of host are, connected to from the internet."""
+        address = address or (PUBLIC[host] if family == 4 else PUBLIC6[host])
+        source = source or (INTERNET if family == 4 else PUBLIC6['i'])
+        r = self.sh('i', f'python3 -c \'import socket; s = socket.create_connection(("{address}", {port}), 3,'
+                         f' ("{source}", 0)); print(s.recv(64).decode())\'')
+        return r.stdout.strip()
+
+    def assertIncoming(self, host='c'):
+        """SSH from the internet to host's address, IPv4 and IPv6, and to c's container behind DNAT, answered directly."""
+        self.assertTrue(self.answers(host).startswith('SSH-2.0-'), host)
+        for source in (PUBLIC6['i'], INTERNET6):
+            self.assertTrue(self.answers(host, family=6, source=source).startswith('SSH-2.0-'), f'{host} from {source}')
+        if host == 'c':
+            self.assertEqual(self.answers('c', 8080), INTERNET)
+
+    def counted(self, host, source):
+        line = [l for l in self.out(host, 'nft list chain inet ofzhur-test prerouting').splitlines() if f'"{source}"' in l][0]
+        return int(line.split('packets ')[1].split()[0])
+
+    def count(self):
+        """Counters on c and x of what comes in through the tunnel from the internet, and from the other client."""
+        for host, other in (('c', 'x'), ('x', 'c')):
+            docker('exec', '-i', self.names[host], 'nft', '-f', '-',
+                   input=COUNTER.format(internet=PUBLIC['i'], mesh=MESH[other]))
+
+    def allowed(self, host):
+        """The AllowedIPs of g on host's interface."""
+        key = self.out('g', 'wg show wg-default public-key').strip()
+        line = [l for l in self.out(host, 'wg show wg-default allowed-ips').splitlines() if l.startswith(key)]
+        return set(line[0].split()[1:])
+
+    def rules(self, host):
+        """The tunnel's rules, IPv4 and IPv6 (those of its protocol): the family, the priority, the rule."""
+        rules = []
+        for f in ('-4', '-6'):
+            for r in self.out(host, f'ip {f} rule show').splitlines():
+                if ' proto 111' in r:
+                    priority, rule = r.split(':', 1)
+                    rules.append(f'{f} {priority} {" ".join(rule.split())}')
+        return sorted(rules)
+
+    def table(self, host, table=32000):
+        """The routes of the tunnel's table, IPv4 and IPv6."""
+        return [r.split() for f in ('-4', '-6') for r in self.out(host, f'ip {f} route show table {table} 2>/dev/null; true').splitlines()]
+
+    def dropins(self, host):
+        """The interfaces whose unit runs tunnel.sh before and once it comes up (the role's drop-in), as systemd read it."""
+        run = 'argv[]=/bin/sh /etc/wireguard/tunnel.sh up ; ignore_errors=yes ;'
+        found = set()
+        for d in self.out(host, 'cd /etc/systemd/system && ls -d wg-quick@*.service.d 2>/dev/null; true').split():
+            unit = d[:-len('.d')]
+            show = self.out(host, f'systemctl show -p ExecStartPre -p ExecStartPost -p NeedDaemonReload -p DropInPaths {unit}')
+            self.assertIn(f'ExecStartPre={{ path=/bin/sh ; {run}', show, f'{host}: {unit}')
+            self.assertIn(f'ExecStartPost={{ path=/bin/sh ; {run}', show, f'{host}: {unit}')
+            self.assertIn('NeedDaemonReload=no\n', show, f'{host}: {unit}')
+            self.assertIn(f'/etc/systemd/system/{d}/ofzhur-wireguard.conf', show, f'{host}: {unit}')
+            found.add(unit[len('wg-quick@'):-len('.service')])
+        return found
+
+    def mtu(self, host, interface):
+        return int(self.out(host, f'cat /sys/class/net/{interface}/mtu'))
+
+    def forwarding(self, uplink='eth0'):
+        """g's forwarding: all, its uplink, its interfaces, its private network."""
+        names = ['all', uplink, 'wg-default', 'wg-lab', 'lan0']
+        return dict(zip(names, self.out('g', 'cd /proc/sys/net/ipv4 && cat ip_forward'
+                                             + ''.join(f' conf/{n}/forwarding' for n in names[1:])).split()))
+
+    def index(self, interface):
+        return self.out('g', f'cat /sys/class/net/{interface}/ifindex').strip()
+
+    def recorded(self):
+        """The interfaces whose forwarding g's tunnel.sh turned on, as it wrote them down: index, name."""
+        return dict(l.split()[:2] for l in self.out('g', 'cat /run/ofzhur-wireguard/forwarding 2>/dev/null; true').splitlines())
+
+    def rename(self, old, new):
+        """g's uplink renamed, as udev renames one: down, renamed, up, its addresses and routes as before."""
+        docker('exec', self.names['g'], 'sh', '-c',
+               f'echo 1 > /proc/sys/net/ipv6/conf/{old}/keep_addr_on_down'
+               f' && ip link set {old} down && ip link set {old} name {new} && ip link set {new} up'
+               f' && sed s/eth0/{new}/g /usr/local/sbin/test-network | sh')
+        self.assertIn(f'default via {PUBLIC["i"]} dev {new} ', self.out('g', 'ip -4 route show default'))
+
+    def assertTunnel(self, priority=32000, table=32000):
+        """The tunnel's state on c and x, and g's as their gateway."""
+        p = priority
+        for host in TUNNELS:
+            self.assertEqual(self.rules(host), sorted([
+                f'-4 {p} from all to 169.254.0.0/16 lookup main proto 111',
+                *([f'-4 {p} from all to {DIRECT} lookup main proto 111'] if host == 'c' else []),
+                f'-4 {p} from all ipproto tcp sport 22 lookup main proto 111',
+                f'-4 {p + 1} from all lookup main suppress_prefixlength 0 proto 111',
+                f'-4 {p + 2} from all fwmark 0x2000/0x2000 lookup main proto 111',
+                f'-4 {p + 3} from all lookup {table} proto 111',
+                f'-6 {p} from all ipproto tcp sport 22 lookup main proto 111',
+                f'-6 {p + 1} from all lookup main suppress_prefixlength 0 proto 111',
+                f'-6 {p + 2} from all fwmark 0x2000/0x2000 lookup main proto 111',
+                f'-6 {p + 3} from all lookup {table} proto 111']), host)
+            self.assertEqual(self.table(host, table), [
+                f'default dev wg-default scope link src {MESH[host]}'.split(),
+                'default dev ofzhur-closed scope link metric 4294967295'.split(),
+                'default dev ofzhur-closed metric 4294967295 pref medium'.split()], host)
+            self.assertEqual(self.out(host, 'wg show wg-default fwmark').strip(), '0x2000', host)
+            self.assertEqual(self.allowed(host), {'0.0.0.0/0', '10.0.0.1/32'}, host)
+            self.assertEqual(self.out(host, 'sysctl -n net.ipv4.conf.all.src_valid_mark').strip(), '1')
+            self.assertEqual(self.out(host, 'systemctl is-enabled ofzhur-wireguard-tunnel; systemctl is-active'
+                                            ' ofzhur-wireguard-tunnel'), 'enabled\nactive\n', host)
+            self.assertIn('table inet ofzhur-wireguard\n', self.out(host, 'nft list tables'))
+            # its uplink eth0 alone, not lo of the unreachable default
+            self.assertIn('elements = { "eth0" }', self.out(host, 'nft list set inet ofzhur-wireguard uplinks'), host)
+            # the unit of the tunnel's interface runs tunnel.sh, not wg-quick; ofzhur-closed has the uplink's MTU
+            self.assertEqual(self.dropins(host), {'wg-default'}, host)
+            self.assertEqual(self.mtu(host, 'ofzhur-closed'), MTU, host)
+        for host in TUNNEL_HOSTS:
+            self.assertNotIn('PostUp', self.out(host, 'cat /etc/wireguard/wg-*.conf'), host)
+        # g forwards on its interfaces that serve and its uplink alone, net.ipv4.ip_forward still off, and wrote them
+        # down by index; its clients go out masqueraded; nothing from wg-default to the networks of g, also by its
+        # rules
+        self.assertEqual(self.forwarding(), {'all': '0', 'eth0': '1', 'wg-default': '1', 'wg-lab': '0', 'lan0': '0'})
+        self.assertEqual(self.recorded(), {self.index(n): n for n in ('eth0', 'wg-default')})
+        self.assertEqual(self.out('g', 'wg show wg-default fwmark').strip(), 'off')
+        table = self.out('g', 'nft list table inet ofzhur-wireguard')
+        self.assertIn(f'iifname "wg-default" oifname != "wg-*" ip saddr {{ {MESH["c"]}, {MESH["x"]} }} masquerade', table)
+        self.assertEqual(self.out('g', 'systemctl is-active ofzhur-wireguard-tunnel').strip(), 'active')
+        self.assertEqual(self.dropins('g'), {'wg-default'})
+        self.assertEqual(self.rules('g'), [f'-4 {p} from all to 10.0.0.0/24 iif wg-default prohibit proto 111',
+                                           f'-4 {p} from all to 10.0.1.0/24 iif wg-default prohibit proto 111'])
+
+    def assertWorks(self):
+        """What the tunnel carries, what stays direct, what comes in."""
+        for host in TUNNELS:
+            self.assertSource(host, PUBLIC['g'])
+            self.assertSource(host, PUBLIC[host], METADATA)
+            # IPv6: nothing new out, on the link or beyond
+            self.assertEqual(self.source(host, PUBLIC6['i']), '')
+            self.assertEqual(self.source(host, INTERNET6), '')
+            self.assertIncoming(host)
+        self.assertSource('c', PUBLIC['c'], DIRECT)
+        self.assertSource('x', PUBLIC['g'], DIRECT)
+        # c's container: out through the tunnel, in directly
+        self.assertSource('c', PUBLIC['g'], netns='app')
+        # WireGuard's own packets direct: the handshake with g is recent
+        self.assertLess(time.time() - int(self.out('c', 'wg show wg-default latest-handshakes').split()[1]), 180)
+
+    def test_01_check(self):
+        # check mode changes nothing
+        self.tunnels()
+        r = self.play('--check')
+        for host in TUNNEL_HOSTS:
+            self.assertNotIn('ofzhur-wireguard', self.out(host, 'nft list tables'), host)
+            self.assertEqual(self.rules(host), [], host)
+            self.assertNotEqual(self.sh(host, 'ls /etc/wireguard/tunnel.sh').returncode, 0, host)
+        self.assertIn('changed: [c]', task(r, 'Tunnel'))
+
+    def test_02_tunnel(self):
+        # direct before
+        self.assertSource('c', PUBLIC['c'])
+        self.assertSource('c', PUBLIC['c'], netns='app')
+        self.tunnels()
+        self.play()
+        self.assertTunnel()
+        self.assertWorks()
+        # systemd-networkd keeps the tunnel's rules; Docker, once there, lets g's clients through
+        for host in TUNNELS:
+            self.assertIn('\nManageForeignRoutingPolicyRules=no\n',
+                          self.out(host, 'cat /etc/systemd/networkd.conf.d/ofzhur-wireguard.conf'))
+        self.assertIn('\nExecStartPost=-/bin/sh /etc/wireguard/tunnel.sh up\n',
+                      self.out('g', 'cat /etc/systemd/system/docker.service.d/ofzhur-wireguard.conf'))
+        self.assertUnchanged(self.play())
+        self.assertUnchanged(self.play('--check'))
+
+    def test_03_isolation(self):
+        # through g, nothing from c reaches x, nothing from the internet the mesh: g's table and its rules each hold
+        # the one, its table alone the other
+        self.count()
+        self.out('i', f'ip route replace 10.0.0.0/24 via {PUBLIC["g"]}')
+        self.addCleanup(self.sh, 'i', 'ip route del 10.0.0.0/24')
+
+        def send():
+            self.sh('c', f'ping -c 3 -i 0.2 -W 1 {MESH["x"]}')
+            self.sh('x', f'ping -c 3 -i 0.2 -W 1 {MESH["c"]}')
+            self.sh('i', f'ping -c 3 -i 0.2 -W 1 {MESH["c"]}; ping -c 3 -i 0.2 -W 1 {MESH["x"]}')
+
+        def counted():
+            return {(h, s): self.counted(h, s) for h in TUNNELS for s in ('internet', 'mesh')}
+
+        send()
+        self.assertEqual(set(counted().values()), {0})
+        self.out('g', 'nft delete table inet ofzhur-wireguard')
+        send()
+        n = counted()
+        self.assertGreater(n['c', 'internet'], 0)
+        self.assertGreater(n['x', 'internet'], 0)
+        self.assertEqual((n['c', 'mesh'], n['x', 'mesh']), (0, 0))
+        for r in self.rules('g'):
+            f, priority, rule = r.split(' ', 2)
+            self.out('g', f'ip {f} rule del priority {priority} {rule}')
+        send()
+        n = counted()
+        self.assertGreater(n['c', 'mesh'], 0)
+        self.assertGreater(n['x', 'mesh'], 0)
+        # the next run puts both back
+        r = self.play()
+        self.assertIn('changed: [g]', task(r, 'Tunnel'))
+        self.assertTunnel()
+        self.count()
+        send()
+        self.assertEqual(set(counted().values()), {0})
+        self.assertWorks()
+
+    def test_04_gateway_down(self):
+        # g's interface down: nothing of c's goes out, directly least of all; SSH and c's container still answer
+        self.out('g', 'ip link set wg-default down')
+        try:
+            self.assertClosed('c')
+            self.assertClosed('c', netns='app')
+            self.assertIncoming()
+            self.assertSource('c', PUBLIC['c'], DIRECT)
+        finally:
+            self.out('g', 'ip link set wg-default up')
+        self.assertSource('c', PUBLIC['g'])
+
+    def test_05_local(self):
+        # c's other networks stay direct, its container's too; a bridge's containers reach each other (br_netfilter
+        # on), the tunnel up or down
+        self.out('c', LOCAL_NETWORKS)
+        self.addCleanup(self.sh, 'c', LOCAL_NETWORKS_GONE)
+        for host, address in (('lan', '0.0.0.0'), ('b3', '0.0.0.0'), ('b3', 'fd88::3')):
+            docker('exec', '-d', self.names['c'], 'ip', 'netns', 'exec', host, 'python3', '/usr/local/bin/whoami.py',
+                   address, '80' if host == 'lan' else '8080')
+        self.assertSource('c', '10.98.0.1', '10.98.0.2', 80, netns='app')
+        # SSH from lan first, then the host to lan: the route there does not change
+        self.assertTrue(self.out('c', 'ip netns exec lan nc -w 3 10.98.0.1 22 </dev/null').startswith('SSH-2.0-'))
+        for _ in range(2):
+            self.assertSource('c', '10.98.0.1', '10.98.0.2', 80)
+        for down in (False, True):
+            if down:
+                self.out('g', 'ip link set wg-default down')
+            try:
+                self.assertSource('c', '10.88.0.2', '10.88.0.3', netns='b2')
+                self.assertSource('c', 'fd88::2', 'fd88::3', netns='b2')
+                self.assertSource('c', '10.98.0.1', '10.98.0.2', 80, netns='app')
+            finally:
+                self.out('g', 'ip link set wg-default up')
+
+        # a port of c's container published on an address that came after the run
+        self.out('c', PUBLISHED)
+        self.addCleanup(self.sh, 'c', 'ip address del 10.231.0.22/32 dev eth0; nft delete table ip app2')
+        self.assertEqual(self.answers('c', 8080, address='10.231.0.22'), INTERNET)
+
+        # systemd-resolved asks a link's resolver from a socket bound to the link: directly; another program's
+        # socket bound to it gets nowhere; the host's other questions go through the tunnel
+        ask = f'python3 /usr/local/bin/ask.py {INTERNET} 53'
+        self.assertEqual(self.out('c', f'setpriv --reuid systemd-resolve --regid systemd-resolve --clear-groups {ask} eth0')
+                         .strip(), PUBLIC['c'])
+        self.assertEqual(self.out('c', f'{ask} eth0').strip(), '')
+        self.assertEqual(self.out('c', ask).strip(), PUBLIC['g'])
+
+    def test_06_interface_down(self):
+        # c's interface down (as at boot before it is up): nothing goes out but through ofzhur-closed; incoming
+        # still answered. Stopped, then up by the run.
+        self.out('c', 'systemctl stop wg-quick@wg-default')
+        self.assertEqual(self.table('c'), ['default dev ofzhur-closed scope link metric 4294967295'.split(),
+                                           'default dev ofzhur-closed metric 4294967295 pref medium'.split()])
+        self.assertClosed('c')
+        self.assertClosed('c', netns='app')
+        self.assertIncoming()
+        self.assertSource('c', PUBLIC['c'], METADATA)
+        # started with a failing tunnel.sh: the interface up, without its route; closed still
+        self.out('c', 'echo "exit 1" > /etc/wireguard/tunnel.sh && systemctl start wg-quick@wg-default')
+        self.assertEqual(self.out('c', 'systemctl is-active wg-quick@wg-default').strip(), 'active')
+        self.assertEqual(self.table('c'), ['default dev ofzhur-closed scope link metric 4294967295'.split(),
+                                           'default dev ofzhur-closed metric 4294967295 pref medium'.split()])
+        self.assertClosed('c')
+        self.assertIncoming()
+        self.play()
+        self.assertTunnel()
+        self.assertSource('c', PUBLIC['g'])
+
+    def test_07_rules_gone(self):
+        # the tunnel's rules gone (systemd-networkd removing others', a person): the guard drops what would leave
+        # directly; incoming still answered
+        for r in self.rules('c'):
+            f, priority, rule = r.split(' ', 2)
+            self.out('c', f'ip {f} rule del priority {priority} {rule}')
+        self.assertEqual(self.rules('c'), [])
+        self.assertClosed('c')
+        self.assertClosed('c', netns='app')
+        self.assertIncoming()
+        r = self.play('--check')
+        self.assertIn('changed: [c]', task(r, 'Tunnel'))
+        self.play()
+        self.assertTunnel()
+        self.assertWorks()
+
+    def test_08_conntrack(self):
+        # conntrack forgets c's connections (conntrack -F; none knew them before the tunnel): in an SSH session c then
+        # speaks first, as in the run's own at the task Tunnel, and the session goes on
+        self.out('c', 'rm -f /tmp/speaking')
+        e = {k: v for k, v in os.environ.items() if not k.startswith('ANSIBLE_')}
+        p = subprocess.Popen(['ansible', 'c', '-m', 'ansible.builtin.shell', '-a', 'touch /tmp/speaking; sleep 5; echo alive',
+                              *AS_UMP], cwd=self.infra.dir, env=e, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for _ in range(60):
+            if self.sh('c', 'test -e /tmp/speaking').returncode == 0:
+                break
+            time.sleep(0.5)
+        self.out('c', 'conntrack -F')
+        out = p.communicate(timeout=120)[0]
+        self.assertEqual(p.returncode, 0, out)
+        self.assertIn('alive', out)
+        self.assertWorks()
+
+    def test_08_table_gone(self):
+        # c's table of nftables gone (nft flush ruleset, a person): what the tunnel carries still goes through it,
+        # nothing directly, IPv6 beyond the link least of all; SSH still answered, by its rules
+        self.out('c', 'nft delete table inet ofzhur-wireguard')
+        self.assertSource('c', PUBLIC['g'])
+        self.assertEqual(self.source('c', INTERNET6), '')
+        self.assertTrue(self.answers('c').startswith('SSH-2.0-'))
+        self.assertTrue(self.answers('c', family=6, source=INTERNET6).startswith('SSH-2.0-'))
+        self.out('g', 'ip link set wg-default down')
+        try:
+            before = len(self.seen())
+            self.assertEqual(self.source('c'), '')
+            self.assertEqual(self.source('c', netns='app'), '')
+            self.assertEqual(self.seen()[before:], [])
+            self.assertTrue(self.answers('c').startswith('SSH-2.0-'))
+        finally:
+            self.out('g', 'ip link set wg-default up')
+        r = self.play()
+        self.assertIn('changed: [c]', task(r, 'Tunnel'))
+        self.assertWorks()
+
+    def test_09_change(self):
+        # another priority and table: the new rules in before the old go; the old table emptied. And back.
+        self.infra.write('inventory/host_vars/c.yml', TUNNELS['c'] + 'wireguard_tunnel_priority: 31000\n'
+                                                                    'wireguard_tunnel_table: 31000\n')
+        self.play()
+        self.assertEqual(self.table('c'), [])
+        self.assertSource('c', PUBLIC['g'])
+        self.assertEqual(sorted(int(r.split()[1]) for r in self.rules('c')), [31000] * 4 + [31001] * 2 + [31002] * 2 + [31003] * 2)
+        self.tunnels()
+        self.play()
+        self.assertTunnel()
+        self.assertUnchanged(self.play())
+
+    def test_09_mtu(self):
+        # the uplink's MTU changed (back to Docker's): the next run gives it to ofzhur-closed in place, the running
+        # interface left as it is; below IPv6's minimum, 1280, and ofzhur-closed keeps IPv6 and its route
+        try:
+            self.out('c', 'ip link set eth0 mtu 1500')
+            self.play()
+            self.assertEqual(self.mtu('c', 'ofzhur-closed'), 1500)
+            self.assertEqual(self.mtu('c', 'wg-default'), MTU - 80)
+            self.out('c', 'ip link add ofzhur-test mtu 1200 type dummy && ip link set ofzhur-test up'
+                          ' && ip route prepend default dev ofzhur-test && sh /etc/wireguard/tunnel.sh up')
+            self.assertEqual(self.mtu('c', 'ofzhur-closed'), 1280)
+            self.assertEqual(self.table('c')[1:], ['default dev ofzhur-closed scope link metric 4294967295'.split(),
+                                                   'default dev ofzhur-closed metric 4294967295 pref medium'.split()])
+        finally:
+            self.sh('c', f'ip link del ofzhur-test; ip link set eth0 mtu {MTU}')
+        self.play()
+        self.assertTunnel()
+        self.assertWorks()
+
+    def test_10_docker(self):
+        # Docker on g: FORWARD drops the clients' traffic until DOCKER-USER lets it through, as the run does, after the
+        # owner's rule there; into Docker's bridges Docker decides, and g's container publishes nothing
+        self.out('g', DOCKER)
+        docker('exec', '-d', self.names['g'], 'ip', 'netns', 'exec', 'ctr', 'python3', '/usr/local/bin/whoami.py', '0.0.0.0', '80')
+        self.assertClosed('c')
+        r = self.play()
+        self.assertIn('changed: [g]', task(r, 'Tunnel'))
+        comment = '-m comment --comment ofzhur-wireguard'
+        self.assertEqual(self.out('g', 'iptables -w -S DOCKER-USER 2>/dev/null').splitlines(), [
+            '-N DOCKER-USER',
+            OWNER,
+            f'-A DOCKER-USER -i wg-default -o docker0 {comment} -j RETURN',
+            f'-A DOCKER-USER -i wg-default -o br-+ {comment} -j RETURN',
+            f'-A DOCKER-USER -i wg-default {comment} -j ACCEPT',
+            f'-A DOCKER-USER -o wg-default -m conntrack --ctstate RELATED,ESTABLISHED {comment} -j ACCEPT',
+            '-A DOCKER-USER -j RETURN'])
+        self.assertWorks()
+        self.assertEqual(self.source('c', '172.18.0.2', 80), '')
+        self.assertUnchanged(self.play())
+
+    def test_11_clients(self):
+        # x through g in lab: g serves both interfaces
+        self.infra.write('inventory/host_vars/x.yml', 'wireguard_tunnel: {host: g, network: lab}\n')
+        self.play()
+        self.assertSource('x', PUBLIC['g'])
+        self.assertEqual(self.table('x')[0], f'default dev wg-lab scope link src {LAB["x"]}'.split())
+        self.assertEqual(self.forwarding(), {'all': '0', 'eth0': '1', 'wg-default': '1', 'wg-lab': '1', 'lan0': '0'})
+        self.assertEqual(self.recorded(), {self.index(n): n for n in ('eth0', 'wg-default', 'wg-lab')})
+        self.assertIn('-4 32000 from all to 10.0.0.0/24 iif wg-lab prohibit proto 111', self.rules('g'))
+        self.assertEqual(self.dropins('g'), {'wg-default', 'wg-lab'})
+        self.assertEqual(self.dropins('x'), {'wg-lab'})
+        # x without a tunnel, and without groups: g serves wg-default alone, and wg-lab forwards no more
+        self.infra.write('inventory/host_vars/x.yml', 'wireguard_groups: []\n')
+        self.play()
+        self.assertEqual(self.rules('x'), [])
+        self.assertSource('x', PUBLIC['x'])
+        self.assertEqual(self.forwarding(), {'all': '0', 'eth0': '1', 'wg-default': '1', 'wg-lab': '0', 'lan0': '0'})
+        self.assertEqual(self.recorded(), {self.index(n): n for n in ('eth0', 'wg-default')})
+        self.assertEqual([r for r in self.rules('g') if 'wg-lab' in r], [])
+        self.assertEqual(self.dropins('g'), {'wg-default'})
+        self.assertEqual(self.dropins('x'), set())
+        self.assertSource('c', PUBLIC['g'])
+        # g's container reaches a peer that is not a client, masqueraded, and gets its answers
+        docker('exec', '-d', self.names['x'], 'python3', '/usr/local/bin/whoami.py', MESH['x'], '8080')
+        self.assertSource('g', MESH['g'], MESH['x'], netns='ctr')
+        self.tunnels()
+        self.play()
+        self.assertTunnel()
+
+    def test_11_cut_short(self):
+        # a run cut short after it wrote a drop-in, before systemd read it: the next run has systemd read it,
+        # changing nothing else
+        f = '/etc/systemd/system/wg-quick@wg-default.service.d/ofzhur-wireguard.conf'
+        self.out('c', f'cp {f} /root/drop-in && echo "# before" >> {f} && systemctl daemon-reload && cat /root/drop-in > {f}')
+        self.assertEqual(self.out('c', 'systemctl show -p NeedDaemonReload --value wg-quick@wg-default').strip(), 'yes')
+        self.assertUnchanged(self.play())
+        self.assertEqual(self.dropins('c'), {'wg-default'})
+
+    def test_11_restart(self):
+        # g's interface restarted: another one, of another index; the record of the one gone is forgotten, and the
+        # new one forwards once it is up, by its unit
+        before = self.index('wg-default')
+        self.out('g', 'systemctl restart wg-quick@wg-default')
+        self.assertNotEqual(self.index('wg-default'), before)
+        self.assertTunnel()
+        # stopped, its record left behind, and its index given to another interface (as one moved in from a network
+        # namespace keeps its own) that forwards by someone else's doing: not the role's, left as it is when the
+        # interface starts again
+        before = self.index('wg-default')
+        self.out('g', f'systemctl stop wg-quick@wg-default && ip link add ofzhur-test index {before} type dummy'
+                      ' && echo 1 > /proc/sys/net/ipv4/conf/ofzhur-test/forwarding')
+        self.addCleanup(self.sh, 'g', 'ip link del ofzhur-test')
+        self.out('g', 'systemctl start wg-quick@wg-default')
+        self.assertEqual(self.out('g', 'cat /proc/sys/net/ipv4/conf/ofzhur-test/forwarding').strip(), '1')
+        self.out('g', 'ip link del ofzhur-test')
+        self.assertTunnel()
+        self.assertWorks()
+        self.assertUnchanged(self.play())
+
+    def test_12_reboot(self):
+        # c restarted without its interface (as at boot before it is up, or when it fails): closed from the start;
+        # SSH and c's container answered
+        self.out('c', 'systemctl mask wg-quick@wg-default')
+        docker('restart', self.names['c'])
+        self.boot()
+        try:
+            self.assertNotEqual(self.sh('c', 'ip link show wg-default').returncode, 0)
+            self.assertClosed('c')
+            self.assertClosed('c', netns='app')
+            self.assertIncoming()
+            self.assertSource('c', PUBLIC['c'], METADATA)
+        finally:
+            self.out('c', 'systemctl unmask wg-quick@wg-default && systemctl start wg-quick@wg-default')
+        # started after the boot: its unit puts the route through it in place; its MTU that of the provider's
+        # network, which came after the tunnel's unit
+        self.assertSource('c', PUBLIC['g'])
+        self.assertEqual(self.mtu('c', 'wg-default'), MTU - 80)
+        # all restarted: the tunnel comes back, guard first, without a run; each interface's MTU as without the
+        # tunnel (g's); nothing to change
+        for host in TUNNEL_HOSTS:
+            docker('restart', self.names[host])
+        self.boot()
+        self.assertTunnel()
+        self.assertWorks()
+        for host in TUNNEL_HOSTS:
+            self.assertEqual(self.mtu(host, 'wg-default'), MTU - 80, host)
+        self.assertUnchanged(self.play())
+
+    def test_13_remove(self):
+        # g's uplink renamed after the run that turned its forwarding on, as udev renames one at boot after the
+        # tunnel's unit ran: still known by its index; the next run turns on nothing, and Docker's bridge, on
+        # already, is not the role's
+        self.out('g', DOCKER)
+        self.play()
+        uplink = self.index('eth0')
+        self.rename('eth0', 'ext01')
+        self.addCleanup(self.rename, 'ext01', 'eth0')
+        r = self.play()
+        self.assertNotIn('changed: [g]', task(r, 'Tunnel'))
+        self.assertEqual(self.forwarding('ext01'), {'all': '0', 'ext01': '1', 'wg-default': '1', 'wg-lab': '0', 'lan0': '0'})
+        self.assertEqual(self.recorded(), {uplink: 'eth0', self.index('wg-default'): 'wg-default'})
+        self.assertWorks()
+
+        # no tunnel any more: check mode tells, and changes nothing
+        before = {h: (self.rules(h), self.out(h, 'nft list tables')) for h in TUNNEL_HOSTS}
+        self.tunnels(False)
+        r = self.play('--check')
+        self.assertIn('changed: [c]', task(r, 'Tunnel of a host tunneled no longer'))
+        self.assertEqual({h: (self.rules(h), self.out(h, 'nft list tables')) for h in TUNNEL_HOSTS}, before)
+        self.assertEqual(self.allowed('c'), {'0.0.0.0/0', '10.0.0.1/32'})
+        self.assertSource('c', PUBLIC['g'])
+
+        # g first: it forwards no more before its rules go, its uplink by its new name too; c, not yet run, stays
+        # closed
+        self.play('--limit', 'g', hosts=['g'])
+        self.assertEqual(self.forwarding('ext01'), {'all': '0', 'ext01': '0', 'wg-default': '0', 'wg-lab': '0', 'lan0': '0'})
+        self.assertEqual(self.recorded(), {})
+        self.assertEqual(self.rules('g'), [])
+        self.assertClosed('c')
+
+        # all of it goes, and c's traffic goes direct
+        self.play()
+        for host in TUNNEL_HOSTS:
+            self.assertEqual(self.rules(host), [], host)
+            self.assertNotIn('ofzhur-wireguard', self.out(host, 'nft list tables'), host)
+            self.assertNotEqual(self.sh(host, 'ip link show ofzhur-closed').returncode, 0, host)
+            self.assertEqual(self.out(host, 'wg show wg-default fwmark').strip(), 'off', host)
+            self.assertNotIn('PostUp', self.out(host, 'cat /etc/wireguard/wg-default.conf'), host)
+            self.assertEqual(self.dropins(host), set(), host)
+            self.assertNotEqual(self.sh(host, 'ls /etc/wireguard/tunnel.sh').returncode, 0, host)
+            self.assertNotEqual(self.sh(host, 'systemctl cat ofzhur-wireguard-tunnel').returncode, 0, host)
+            self.assertEqual(self.out(host, 'sysctl -n net.ipv4.conf.all.src_valid_mark').strip(), '0', host)
+            self.assertNotEqual(self.sh(host, 'test -e /etc/systemd/networkd.conf.d/ofzhur-wireguard.conf'
+                                              ' || test -e /etc/systemd/system/docker.service.d/ofzhur-wireguard.conf')
+                                .returncode, 0, host)
+        for host in TUNNELS:
+            self.assertEqual(self.allowed(host), {'10.0.0.1/32'}, host)
+            self.assertEqual(self.table(host), [], host)
+            self.assertSource(host, PUBLIC[host])
+            self.assertSource(host, PUBLIC6[host], PUBLIC6['i'])
+            self.assertSource(host, PUBLIC6[host], INTERNET6)
+        self.assertSource('c', PUBLIC['c'], netns='app')
+        self.assertEqual(self.forwarding('ext01'), {'all': '0', 'ext01': '0', 'wg-default': '0', 'wg-lab': '0', 'lan0': '0'})
+        self.assertEqual(self.out('g', 'cat /proc/sys/net/ipv4/conf/docker0/forwarding').strip(), '1')
+        self.assertEqual(self.out('g', 'iptables -w -S DOCKER-USER 2>/dev/null').splitlines(),
+                         ['-N DOCKER-USER', OWNER, '-A DOCKER-USER -j RETURN'])
+        self.assertIncoming()
+        self.assertUnchanged(self.play())
+        self.assertUnchanged(self.play('--check'))
 
 
 if __name__ == '__main__':

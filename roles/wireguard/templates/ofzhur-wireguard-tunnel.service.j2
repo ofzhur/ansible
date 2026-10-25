@@ -1,0 +1,24 @@
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+# Managed by Ansible: ofzhur.ansible.wireguard. Changes here are overwritten.
+# The tunnel of this host, in place before the network comes up: a
+# tunneled host sends nothing directly that the tunnel would carry, also
+# before its interface is up. After nftables.service, whose ruleset may
+# flush every table. No ExecStop: stopping the unit leaves the tunnel in
+# place; the units of its interfaces (a drop-in) and every run of the role
+# put it in place too.
+[Unit]
+Description=WireGuard tunnel (ofzhur.ansible.wireguard)
+Wants=network-pre.target
+After=nftables.service
+Before=network-pre.target shutdown.target
+Conflicts=shutdown.target
+DefaultDependencies=no
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh /etc/wireguard/tunnel.sh up
+
+[Install]
+WantedBy=sysinit.target

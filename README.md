@@ -12,7 +12,7 @@ used by every infrastructure that includes it. Servers are installed by
 | `ansible.cfg` for a control machine (Ansible runs there and reaches servers over SSH) | [config/push/ansible.cfg](config/push/ansible.cfg) |
 | `ofzhur.ansible.users`: role, OS users and groups with SSH keys and sudo, each targeted at hosts by a pattern | [roles/users](roles/users/README.md) |
 | `ofzhur.ansible.firewall`: role, a host firewall, nftables or iptables, from policy as code; other roles announce what they need | [roles/firewall](roles/firewall/README.md) |
-| `ofzhur.ansible.wireguard`: role, a WireGuard mesh over the private networks ump gives its servers, isolated by group | [roles/wireguard](roles/wireguard/README.md) |
+| `ofzhur.ansible.wireguard`: role, a WireGuard mesh over the private networks ump gives its servers, isolated by group, and tunnels through a peer, a NAT gateway | [roles/wireguard](roles/wireguard/README.md) |
 | `ofzhur.ansible.base`: playbook, the base of every server ump installs (the group `common`; the role `users`) | [playbooks/base.yml](playbooks/base.yml) |
 
 Requires ansible-core 2.16 or later. Plugins use Python's standard library
@@ -242,6 +242,15 @@ without groups, which reach each other but not them.
 A server joins on its first run, and its peers know it once they ran
 after it: after adding a server, run on the whole fleet.
 
+A server may send its outgoing traffic through a peer, its gateway,
+which masquerades it; connections to its own address are answered
+directly, and nothing leaves it directly while the tunnel is down:
+
+```yaml
+# inventory/host_vars/app-01.yml
+wireguard_tunnel: gw-01
+```
+
 ## Storages
 
 The facts in a storage and the host files in a storage take the URLs of
@@ -357,6 +366,6 @@ the way the template expects; for another ansible-core, put it first on
 run the storages on containers (MinIO, Consul, Vault, sshd;
 [tests/storages.py](tests/storages.py)), and the roles run on containers
 (Ubuntu 24.04, Debian 13): `test_users.py` the playbook `base`,
-`test_firewall.py` and `test_wireguard.py` their role, `test_mesh.py`
-both on six servers, isolated by group; without Docker, those parts are
-skipped.
+`test_firewall.py` and `test_wireguard.py` their role (the latter a
+tunnel too, its gateway and an internet), `test_mesh.py` both on six
+servers, isolated by group; without Docker, those parts are skipped.

@@ -17,3 +17,14 @@ wireguard_ports: {}
 
 # Let the peers in through ofzhur.ansible.firewall.
 wireguard_firewall: true
+
+# A tunnel: wireguard_tunnel, unset here, names the gateway of the host,
+# the peer its outgoing IPv4 leaves through. These IPv4 networks stay
+# direct, beside link-local and main's routes but its default.
+wireguard_tunnel_direct: []
+
+# The mark (one bit) and the routing table of a tunneled host, and the
+# first of the four priorities of its rules (a gateway's rules: that one).
+wireguard_tunnel_mark: 0x2000
+wireguard_tunnel_table: 32000
+wireguard_tunnel_priority: 32000

@@ -1,0 +1,513 @@
+#!/bin/sh
+{# Copyright (c) 2026 Oleg Zhurko <oleg@zhurko.de> #}
+{# MIT License (see LICENSE) #}
+{% set m = '0x%x' % wireguard_tunnel_mark %}
+{% set p = wireguard_tunnel_priority %}
+{% set ssh = ansible_port | default(22) | int %}
+# Managed by Ansible: ofzhur.ansible.wireguard. Changes here are overwritten.
+# The tunnel of this host. "up" puts it in place and takes away what no
+# longer belongs to it; "check" tells whether up would change anything, and
+# changes nothing. Run at boot before the network
+# (ofzhur-wireguard-tunnel.service), by the unit of an interface of the
+# tunnel before it comes up and once it is (a drop-in of wg-quick@), and
+# by every run of the role. What is in place stays as it is.
+set -eu
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export LC_ALL=C
+
+case ${1:-up} in
+up) dry= ;;
+check) dry=1 ;;
+*) echo "usage: $0 [up|check]" >&2; exit 2 ;;
+esac
+
+{% if __wireguard_client %}
+# Tunneled through {{ __wireguard_client.gateway }} in {{ __wireguard_client.name }}.
+client={{ __wireguard_client.iface }}
+address={{ __wireguard_client.address }}
+{% else %}
+client=
+address=
+{% endif %}
+# The gateway of the clients of these interfaces.
+served='{{ __wireguard_served | map(attribute='iface') | join(' ') }}'
+mark={{ m }}
+table={{ wireguard_tunnel_table }}
+# The protocol of the tunnel's routing rules, by which they are known.
+proto=111
+state=/run/ofzhur-wireguard
+nl='
+'
+changed=
+# IPv6, unless the kernel was booted without it (ipv6.disable=1).
+ipv6=
+[ ! -d /proc/sys/net/ipv6 ] || ipv6=1
+
+# A change: made by up, told by check.
+change() {
+	changed=1
+	[ -n "$dry" ] || "$@"
+}
+
+# The lines of $1 that are not lines of $2.
+missing() {
+	(
+		IFS=$nl
+		set -f
+		for l in $1; do
+			case "$nl$2$nl" in
+			*"$nl$l$nl"*) ;;
+			*) printf '%s\n' "$l" ;;
+			esac
+		done
+	)
+}
+
+put() {
+	echo "$2" > "$1"
+}
+
+# One at a time: at boot the interfaces' units and Docker may run it
+# together.
+if [ -z "$dry" ]; then
+	mkdir -p "$state"
+	exec 9> "$state/lock"
+	flock 9
+fi
+
+# What this script changed of the kernel's settings, until the next boot:
+# a line each, known by its first word.
+remember() {
+	mkdir -p "$state"
+	forget "$1" "${2%% *}"
+	echo "$2" >> "$state/$1"
+}
+forget() {
+	awk -v k="$2" '$1 != k' "$state/$1" > "$state/$1.new" 2>/dev/null || true
+	if [ -s "$state/$1.new" ]; then
+		mv "$state/$1.new" "$state/$1"
+	else
+		rm -f "$state/$1.new" "$state/$1"
+	fi
+}
+
+# An interface by its index and its hardware address, which stay when it
+# is renamed (udev, at boot): the index and the address of a name, the
+# name of an index; nothing if none.
+index() {
+	cat "/sys/class/net/$1/ifindex" 2>/dev/null || true
+}
+hwaddr() {
+	cat "/sys/class/net/$1/address" 2>/dev/null || true
+}
+named() {
+	for d in /sys/class/net/*; do
+		if [ "$(cat "$d/ifindex" 2>/dev/null)" = "$1" ]; then
+			echo "${d##*/}"
+			return
+		fi
+	done
+}
+
+{% if __wireguard_client or __wireguard_served %}
+# The uplinks, the interfaces of main's default routes, where the
+# internet is: those of now, and those the last run of the role saw (at
+# boot, before the network, main has none yet). Read anew each time. Not
+# lo, of an IPv6 default unreachable or blackhole.
+uplinks=$(
+	{
+		ip -4 route show table main default
+		[ -z "$ipv6" ] || ip -6 route show table main default
+	} | sed -n 's/.* dev \([^ ]*\).*/\1/p'
+	printf '%s\n' {{ __wireguard_tunnel_probe.stdout_lines | select('match', 'uplink ') | map('regex_replace', '^uplink ', '') | map('quote') | join(' ') }}
+)
+uplinks=$(printf '%s\n' "$uplinks" | grep -vx -e '' -e lo -e 'wg-.*' -e ofzhur-closed | sort -u)
+{% else %}
+uplinks=
+{% endif %}
+
+# --- Forwarding off ----------------------------------------------------------
+
+# A gateway forwards, interface by interface, where its clients' packets
+# come in: on the interfaces it serves, and on the uplinks, where the
+# answers come in (IPv4 forwards by the interface a packet came in on).
+# Nowhere else. net.ipv4.ip_forward, the switch of all, stays as it is.
+# Software that forwards (Docker, Kubernetes) turns that one on, and then
+# every interface forwards anyway. While it is off, what this script
+# turned on and is needed no more goes off first, before the rules of the
+# gateway go: by its index, under its name, or renamed with its address.
+# An index gone is forgotten, as is one the kernel gave another interface
+# since, of another name and address (one moved in from a network
+# namespace keeps its index): not this script's.
+conf=/proc/sys/net/ipv4/conf
+needed=
+[ -z "$served" ] || needed=$(echo $served $uplinks)
+if [ -e "$state/forwarding" ]; then
+	all=$(cat /proc/sys/net/ipv4/ip_forward)
+	while read -r n was a; do
+		[ -n "$n" ] || continue
+		i=$(named "$n")
+		if [ -n "$i" ] && { [ "$i" = "$was" ] || { [ -n "$a" ] && [ "$(hwaddr "$i")" = "$a" ]; }; }; then
+			case " $needed " in *" $i "*) continue ;; esac
+			if [ "$all" = 0 ] && [ -e "$conf/$i" ] && [ "$(cat "$conf/$i/forwarding")" = 1 ]; then
+				change put "$conf/$i/forwarding" 0
+			fi
+		fi
+		change forget forwarding "$n"
+	done <<EOF
+$(cat "$state/forwarding")
+EOF
+fi
+
+# --- nftables ----------------------------------------------------------------
+{% if __wireguard_client %}
+
+# Main's routes but its default through the uplinks, read anew each time
+# as they are: the tunnel's rule sends to them directly.
+quoted=$(printf '%s\n' "$uplinks" | awk 'NF { s = s (s == "" ? "" : ", ") "\"" $0 "\"" } END { print s }')
+routed=$(ip -o -4 route show table main type unicast | awk -v up=" $(echo $uplinks) " '
+	$1 != "default" { for (i = 2; i < NF; i++) if ($i == "dev" && index(up, " " $(i + 1) " ")) { print $1; next } }' \
+	| sort -u | awk '{ s = s (NR > 1 ? ", " : "") $0 } END { print s }')
+elements_uplinks=
+[ -z "$quoted" ] || elements_uplinks="elements = { $quoted }"
+elements_routed=
+[ -z "$routed" ] || elements_routed="elements = { $routed }"
+
+# systemd-resolved asks the resolvers of a link from a socket bound to
+# it: they leave by that link, never through the tunnel, and directly.
+resolver=$(id -u systemd-resolve 2>/dev/null || true)
+dns=
+[ -z "$resolver" ] || dns="meta skuid $resolver meta l4proto { tcp, udp } th dport { 53, 853 } accept"
+{% endif %}
+
+# The table of the role, replaced whole (one transaction): never the
+# firewall's. Base chains with policy accept: what they do not drop, the
+# other tables decide.
+ruleset() {
+	cat <<EOF
+table inet ofzhur-wireguard {
+{% if __wireguard_client %}
+	set uplinks {
+		type ifname
+		$elements_uplinks
+	}
+
+	# Always direct: link-local (cloud metadata), link-local multicast,
+	# broadcast, wireguard_tunnel_direct.
+	set direct {
+		type ipv4_addr
+		flags interval
+		auto-merge
+		elements = { {{ __wireguard_client.direct | join(', ') }}, 224.0.0.0/24, 255.255.255.255 }
+	}
+
+	# Main's routes but its default, through the uplinks.
+	set routed {
+		type ipv4_addr
+		flags interval
+		auto-merge
+		$elements_routed
+	}
+
+	# In on an uplink: the connections from outside, to the host's
+	# addresses (before DNAT: a container's published port is one) or
+	# beyond, and the replies to what left there directly; not the
+	# tunnel's own, to its address. The connection carries the mark (the
+	# same bit of its conntrack mark), and so do its packets: they and
+	# their answers take main, the way they came, and the reverse path
+	# filter finds them there. What came in through the tunnel is answered
+	# through it.
+	chain prerouting {
+		type filter hook prerouting priority mangle; policy accept;
+		iifname @uplinks ip daddr != $address ct mark set ct mark | $mark
+		iifname @uplinks meta nfproto ipv6 ct mark set ct mark | $mark
+		ct mark & $mark == $mark meta mark set meta mark | $mark
+	}
+
+	# The host's own packets of those connections.
+	chain output {
+		type route hook output priority mangle; policy accept;
+		ct mark & $mark == $mark meta mark set meta mark | $mark
+	}
+
+	# Fail closed: out of an uplink, IPv4 and IPv6, only what carries the
+	# mark (WireGuard's own packets, the connections from outside),
+	# replies, SSH's (also of a connection conntrack took up from this
+	# side), the direct networks, main's routes but its default, DHCP,
+	# systemd-resolved's queries, and what IPv6 needs on the link. The
+	# other interfaces (bridges, containers, private networks) are not
+	# the internet. Into the tunnel, a container's TCP MSS clamped to its
+	# MTU.
+	chain guard {
+		type filter hook postrouting priority filter; policy accept;
+		oifname "$client" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+		oifname != @uplinks accept
+		meta mark & $mark == $mark accept
+		ct direction reply accept
+		tcp sport {{ ssh }} accept
+		ip daddr @direct accept
+		ip daddr @routed accept
+		udp sport 68 udp dport 67 accept
+		udp sport 546 udp dport 547 accept
+		$dns
+		ip6 daddr { fe80::/10, ff02::/16 } accept
+		icmpv6 type { nd-router-solicit, nd-neighbor-solicit, nd-neighbor-advert, mld-listener-report, mld2-listener-report } accept
+		drop
+	}
+{% endif %}
+{% if __wireguard_served %}
+	# Through the gateway: the clients out of the other interfaces. Nothing
+	# from one WireGuard interface to another (isolation, networks apart),
+	# nothing conntrack does not know (invalid, untracked); new connections
+	# from other peers only to what is addressed to this host (DNAT, a
+	# published port).
+	chain forward {
+		type filter hook forward priority filter; policy accept;
+{% for s in __wireguard_served %}
+		iifname "{{ s.iface }}" ct state invalid,untracked drop
+		oifname "{{ s.iface }}" ct state invalid,untracked drop
+		oifname "{{ s.iface }}" tcp flags & (syn | rst) == syn tcp option maxseg size set rt mtu
+		iifname "{{ s.iface }}" oifname "wg-*" drop
+		iifname "{{ s.iface }}" ct direction original ct status & dnat == 0 ip saddr != { {{ s.clients | join(', ') }} } drop
+{% endfor %}
+	}
+
+	# Into the mesh, after the source NAT: replies to the clients, and
+	# what leaves as this host (its own, its containers masqueraded); not
+	# the internet.
+	chain inbound {
+		type filter hook postrouting priority 110; policy accept;
+{% for s in __wireguard_served %}
+		oifname "{{ s.iface }}" ct direction original ct status & dnat == 0 ip saddr != {{ s.address }} drop
+{% endfor %}
+	}
+
+	# The clients leave as this host.
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+{% for s in __wireguard_served %}
+		iifname "{{ s.iface }}" oifname != "wg-*" ip saddr { {{ s.clients | join(', ') }} } masquerade
+{% endfor %}
+	}
+{% endif %}
+}
+EOF
+}
+
+# Loaded anew when it differs from what was loaded last, or what was loaded
+# is not there as it was (gone, flushed, edited): the checksums of both.
+listing() {
+	nft list table inet ofzhur-wireguard 2>/dev/null | sha256sum | cut -d ' ' -f 1
+}
+{% if __wireguard_client or __wireguard_served %}
+sum="$(ruleset | sha256sum | cut -d ' ' -f 1) $(listing)"
+if [ "$sum" != "$(cat "$state/nft" 2>/dev/null)" ]; then
+	load() {
+		{ echo 'table inet ofzhur-wireguard'; echo 'delete table inet ofzhur-wireguard'; ruleset; } | nft -f -
+		echo "$(ruleset | sha256sum | cut -d ' ' -f 1) $(listing)" > "$state/nft"
+	}
+	change load
+fi
+{% endif %}
+
+# --- Routing -----------------------------------------------------------------
+
+# A client's rules, IPv4: the direct networks, SSH's replies (also
+# without the table of nftables), main's routes but its default, the
+# marked packets, all through main; then the tunnel's table. IPv6 the
+# same, but the direct networks. That table always has a route: through
+# the interface while it is up, else through ofzhur-closed, WireGuard
+# without peers, where nothing goes anywhere; for IPv6 that one alone. A
+# lookup never gets past it to main's default route, and a reply finds a
+# route, which the mark then changes for main's.
+# A gateway's rules: nothing from a served interface to the networks of
+# this host (isolation, also without the table of nftables).
+rules=
+routes=
+{% if __wireguard_client %}
+rules='{% for n in __wireguard_client.direct %}-4 priority {{ p }} to {{ n | regex_replace('/32$', '') }} lookup main
+{% endfor %}-4 priority {{ p }} ipproto tcp sport {{ ssh }} lookup main
+-4 priority {{ p + 1 }} lookup main suppress_prefixlength 0
+-4 priority {{ p + 2 }} fwmark {{ m }}/{{ m }} lookup main
+-4 priority {{ p + 3 }} lookup {{ wireguard_tunnel_table }}'
+routes='-4 default dev ofzhur-closed scope link metric 4294967295'
+if [ -n "$ipv6" ]; then
+	rules="$rules
+-6 priority {{ p }} ipproto tcp sport {{ ssh }} lookup main
+-6 priority {{ p + 1 }} lookup main suppress_prefixlength 0
+-6 priority {{ p + 2 }} fwmark {{ m }}/{{ m }} lookup main
+-6 priority {{ p + 3 }} lookup {{ wireguard_tunnel_table }}"
+	routes="$routes$nl-6 default dev ofzhur-closed metric 4294967295 pref medium"
+fi
+if [ -n "$(ip link show dev "$client" up 2>/dev/null)" ]; then
+	routes="-4 default dev $client scope link src $address$nl$routes"
+fi
+
+# ofzhur-closed has the MTU of the uplink (that of main's IPv4 default
+# route, else one the last run saw), 1500 if unknown: wg-quick takes an
+# interface's MTU from the route to its peers, through ofzhur-closed
+# while the tunnel is down, and so sets the one it would without the
+# tunnel. Read anew before an interface of the tunnel comes up, once the
+# network has set the uplink's. With IPv6, 1280 at least: below it, the
+# kernel takes IPv6 off the interface, and its route with it.
+mtu=1500
+for i in $(ip -4 route show table main default | sed -n 's/.* dev \([^ ]*\).*/\1/p') $uplinks; do
+	case $i in wg-* | ofzhur-closed) continue ;; esac
+	if [ -r "/sys/class/net/$i/mtu" ]; then
+		mtu=$(cat "/sys/class/net/$i/mtu")
+		break
+	fi
+done
+if [ -n "$ipv6" ] && [ "$mtu" -lt 1280 ]; then
+	mtu=1280
+fi
+if [ ! -e /sys/class/net/ofzhur-closed ]; then
+	closed() {
+		ip link add ofzhur-closed mtu "$mtu" type wireguard
+		[ -z "$ipv6" ] || put /proc/sys/net/ipv6/conf/ofzhur-closed/disable_ipv6 0
+		ip link set ofzhur-closed up
+	}
+	change closed
+else
+	if [ -n "$ipv6" ] && [ "$(cat /proc/sys/net/ipv6/conf/ofzhur-closed/disable_ipv6)" != 0 ]; then
+		change put /proc/sys/net/ipv6/conf/ofzhur-closed/disable_ipv6 0
+	fi
+	if [ "$(cat /sys/class/net/ofzhur-closed/mtu)" != "$mtu" ]; then
+		change ip link set ofzhur-closed mtu "$mtu"
+	fi
+	if [ -z "$(ip link show dev ofzhur-closed up)" ]; then
+		change ip link set ofzhur-closed up
+	fi
+fi
+
+# Reverse path filtering by the mark, as the routes are.
+f=/proc/sys/net/ipv4/conf/all/src_valid_mark
+if [ "$(cat $f)" = 0 ]; then
+	change put $f 1
+	change remember sysctl src_valid_mark
+fi
+{% endif %}
+{% if __wireguard_served %}
+rules='{% for s in __wireguard_served %}{% for n in __wireguard %}-4 priority {{ p }} to {{ n.cidr }} iif {{ s.iface }} prohibit
+{% endfor %}{% endfor %}'
+{% endif %}
+
+# The rules of the tunnel, by their protocol; the routes of its table.
+have_rules() {
+	for f in -4 ${ipv6:+-6}; do
+		ip $f rule show | sed -En -e 's/ \[detached\]//' \
+			-e "s/^([0-9]+):[[:space:]]*from all (.*) proto $proto[[:space:]]*\$/$f priority \1 \2/p"
+	done
+}
+have_routes() {
+	[ -n "$client" ] || return 0
+	for f in -4 ${ipv6:+-6}; do
+		ip $f route show table "$table" 2>/dev/null | sed -e 's/[[:space:]]*$//' -e "s/^/$f /"
+	done
+}
+
+# What is new goes in before what is old goes: no moment without a route
+# or a rule.
+while IFS= read -r r; do
+	[ -z "$r" ] || change ip ${r%% *} route replace ${r#* } table "$table"
+done <<EOF
+$(missing "$routes" "$(have_routes)")
+EOF
+while IFS= read -r r; do
+	[ -z "$r" ] || change ip ${r%% *} rule add ${r#* } proto $proto
+done <<EOF
+$(missing "$rules" "$(have_rules)")
+EOF
+
+# The rules that go, the tunnel's first; a table they looked up is emptied.
+while IFS= read -r r; do
+	[ -n "$r" ] || continue
+	change ip ${r%% *} rule del ${r#* } proto $proto
+	case $r in
+	*' lookup '*)
+		t=${r##*lookup }
+		t=${t%% *}
+		if [ "$t" != main ] && { [ -z "$client" ] || [ "$t" != "$table" ]; } \
+			&& [ -n "$(ip ${r%% *} route show table "$t" 2>/dev/null)" ]; then
+			change ip ${r%% *} route flush table "$t"
+		fi
+		;;
+	esac
+done <<EOF
+$(missing "$(have_rules)" "$rules" | sort -k 3,3nr)
+EOF
+while IFS= read -r r; do
+	[ -z "$r" ] || change ip ${r%% *} route del ${r#* } table "$table"
+done <<EOF
+$(missing "$(have_routes)" "$routes")
+EOF
+if [ -z "$client" ] && [ -e /sys/class/net/ofzhur-closed ]; then
+	change ip link del ofzhur-closed
+fi
+
+if [ -z "$client" ] && grep -qsx src_valid_mark "$state/sysctl"; then
+	change put /proc/sys/net/ipv4/conf/all/src_valid_mark 0
+	change rm "$state/sysctl"
+fi
+
+# --- Docker ------------------------------------------------------------------
+
+# Docker drops what it does not forward itself (the policy of FORWARD):
+# its chain DOCKER-USER lets the clients through, after the rules others
+# put there (before Docker's RETURN at its end); the role's table decides.
+# Into Docker's own bridges, Docker decides: its published ports alone.
+if command -v iptables >/dev/null && iptables -w -n -L DOCKER-USER >/dev/null 2>&1; then
+	c='-m comment --comment ofzhur-wireguard'
+	want=
+	for i in $served; do
+		want="$want-A DOCKER-USER -i $i -o docker0 $c -j RETURN$nl"
+		want="$want-A DOCKER-USER -i $i -o br-+ $c -j RETURN$nl"
+		want="$want-A DOCKER-USER -i $i $c -j ACCEPT$nl"
+		want="$want-A DOCKER-USER -o $i -m conntrack --ctstate RELATED,ESTABLISHED $c -j ACCEPT$nl"
+	done
+	have=$(iptables -w -S DOCKER-USER | grep -e '--comment ofzhur-wireguard ' || true)
+	if [ "$have" != "${want%"$nl"}" ]; then
+		at=$(iptables -w -S DOCKER-USER | grep -c '^-A ' || true)
+		[ "$(iptables -w -S DOCKER-USER | tail -n 1)" = '-A DOCKER-USER -j RETURN' ] || at=$((at + 1))
+		while IFS= read -r r; do
+			[ -n "$r" ] || continue
+			change iptables -w -I DOCKER-USER $at ${r#-A DOCKER-USER }
+			at=$((at + 1))
+		done <<EOF
+$want
+EOF
+		while IFS= read -r r; do
+			[ -z "$r" ] || change iptables -w -D ${r#-A }
+		done <<EOF
+$have
+EOF
+	fi
+fi
+
+# --- Forwarding on -----------------------------------------------------------
+
+# Once the gateway's rules are in place, written down by index, name and
+# address (WireGuard's has none). An interface not there under its name
+# (at boot before the network, the uplinks before udev renamed them) gets
+# it from the runs after, once the network is up: the units of the
+# interfaces, the role.
+for i in $needed; do
+	n=$(index "$i")
+	if [ -n "$n" ] && [ -e "$conf/$i" ] && [ "$(cat "$conf/$i/forwarding")" = 0 ]; then
+		a=$(hwaddr "$i")
+		change put "$conf/$i/forwarding" 1
+		change remember forwarding "$n $i${a:+ $a}"
+	fi
+done
+{% if not (__wireguard_client or __wireguard_served) %}
+
+# No tunnel: the table goes, after the rules and the forwarding.
+if nft list table inet ofzhur-wireguard >/dev/null 2>&1; then
+	change nft delete table inet ofzhur-wireguard
+fi
+if [ -e "$state/nft" ]; then
+	change rm "$state/nft"
+fi
+{% endif %}
+
+[ -z "$changed" ] || echo changed

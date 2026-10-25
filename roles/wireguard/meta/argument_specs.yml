@@ -6,6 +6,7 @@ argument_specs:
     short_description: A WireGuard mesh over the private networks of the hosts
     description:
       - One interface C(wg-NAME) per private network of the host, its peers the other hosts of the inventory in that network, isolated by group.
+      - A host may send its outgoing IPv4 through a peer, its gateway (O(wireguard_tunnel)), which forwards and masquerades it.
       - The private key is generated on the host and never leaves it; the public key goes to the fact cache as C(wireguard_public_keys).
       - The variables go into the inventory (group_vars, host_vars), where the other hosts see them; a role parameter or a play variable fails the run.
       - A wrong type or an invalid network fails the run before any change.
@@ -42,3 +43,30 @@ argument_specs:
           - C(false) withdraws the announcements.
         type: bool
         default: true
+      wireguard_tunnel:
+        description:
+          - 'The gateway of the host: the peer its outgoing IPv4 leaves through, forwarded and masqueraded there. The inventory hostname of the peer, or C({host: NAME, network: NAME}) when the two share more than one network.'
+          - Not set, no tunnel. The gateway is a peer of the host in that network, not the host itself, and has no tunnel of its own.
+          - Incoming connections to the addresses of the host are answered directly; IPv6 gets no new outgoing connections; without the tunnel up, nothing leaves directly but what O(wireguard_tunnel_direct) and main's routes but its default name.
+        type: raw
+      wireguard_tunnel_direct:
+        description:
+          - IPv4 networks a tunneled host reaches directly, beside link-local C(169.254.0.0/16) and the routes of the table main but its default.
+        type: list
+        elements: str
+        default: []
+      wireguard_tunnel_mark:
+        description:
+          - The firewall mark of a tunneled host, one bit (a power of two up to C(0x80000000)), set and matched alone, other bits kept; the same bit of the conntrack mark. WireGuard's own packets and the connections from outside carry it, and leave directly.
+        type: int
+        default: 0x2000
+      wireguard_tunnel_table:
+        description:
+          - The routing table of a tunneled host, its default route through the interface of the tunnel. Not C(253), C(254), C(255) (default, main, local).
+        type: int
+        default: 32000
+      wireguard_tunnel_priority:
+        description:
+          - The priority of the first of the four routing rules of a tunneled host, which take it to three after; a gateway's rules take it alone. At most C(32762), before the rule of main.
+        type: int
+        default: 32000
